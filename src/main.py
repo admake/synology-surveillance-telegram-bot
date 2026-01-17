@@ -88,46 +88,70 @@ class SynologyAPI:
         # Сессия истекает через 10 минут
         return (time.time() - self.last_login) < 600
 
+    # В файле src/surveillance_bot.py найдите функцию get_events и ЗАМЕНИТЕ её:
+
     @retry(
         stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=5)
     )
     def get_events(self, start_time, end_time, camera_id=None):
-        """Получает список событий движения"""
+        """Получает список событий движения - ИСПРАВЛЕННАЯ ВЕРСИЯ"""
         if not self.is_session_valid():
             self.login()
 
         try:
-            event_url = f"{self.base_url}/SurveillanceStation/camera.cgi"
+            # Используем правильный endpoint и версию API
+            event_url = f"{self.base_url}/webapi/entry.cgi"
+
+            # БАЗОВЫЕ параметры для версии 9 (которая работает)
             params = {
                 "api": "SYNO.SurveillanceStation.Camera.Event",
                 "method": "list",
-                "version": "1",
+                "version": "9",  # ← ВАЖНО: версия 9 из диагностики
                 "_sid": self.sid,
                 "fromTime": start_time,
                 "toTime": end_time,
-                "eventFilter": "motion",
-                "locked": "false",
-                "blIncludeSnapshot": "false",
             }
 
+            # Добавляем cameraIds только если указан
             if camera_id:
-                params["cameraIds"] = camera_id
+                params["cameraIds"] = str(camera_id)
 
-            response = self.session.get(event_url, params=params, timeout=15)
-            response.raise_for_status()
+            # Пробуем разные комбинации параметров если первая не сработает
+            test_cases = [
+                params,  # 1. Без фильтров
+                {**params, "eventFilter": "motion"},  # 2. С фильтром движения
+                {**params, "blIncludeSnapshot": "false"},  # 3. Без снимков
+                {**params, "limit": "100", "offset": "0"},  # 4. С лимитом
+            ]
 
-            data = response.json()
-            if data.get("success"):
-                events = data.get("data", {}).get("events", [])
-                logger.info(f"Retrieved {len(events)} motion events")
-                return events
+            for i, test_params in enumerate(test_cases):
+                try:
+                    logger.debug(f"Пробуем параметры #{i+1}: {test_params}")
+                    response = self.session.get(
+                        event_url, params=test_params, timeout=15
+                    )
+                    response.raise_for_status()
 
-            logger.warning(f"No events or API error: {data}")
+                    data = response.json()
+                    if data.get("success"):
+                        events = data.get("data", {}).get("events", [])
+                        logger.info(
+                            f"Retrieved {len(events)} events with params #{i+1}"
+                        )
+                        return events
+                    else:
+                        logger.debug(f"Params #{i+1} failed: {data.get('error')}")
+
+                except Exception as e:
+                    logger.debug(f"Params #{i+1} error: {e}")
+                    continue
+
+            # Если ни один вариант не сработал
+            logger.warning("All parameter combinations failed for events API")
             return []
 
         except RequestException as e:
             logger.error(f"Error fetching events: {e}")
-            # Если ошибка связана с сессией, сбрасываем sid
             if "session" in str(e).lower():
                 self.sid = None
             raise
