@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  surveillance-bot:
+    image: ghcr.io/YOUR_USERNAME/synology-surveillance-telegram-bot:latest
+    container_name: synology-surveillance-bot
+    restart: unless-stopped
+    stop_grace_period: 30s
+    
+    environment:
+      - SYNO_IP=${SYNO_IP}
+      - SYNO_PORT=${SYNO_PORT:-5001}
+      - SYNO_USER=${SYNO_USER}
+      - SYNO_PASS=${SYNO_PASS}
+      - CAMERA_ID=${CAMERA_ID:-1}
+      - TG_TOKEN=${TG_TOKEN}
+      - TG_CHAT_ID=${TG_CHAT_ID}
+      - CHECK_INTERVAL=${CHECK_INTERVAL:-30}
+      - LOOKBACK_MINUTES=${LOOKBACK_MINUTES:-5}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - STATE_FILE=/data/state.json
+      - SSL_VERIFY=${SSL_VERIFY:-false}
+    
+    volumes:
+      - /docker/surveillance-bot/data:/data:rw
+    
+    networks:
+      - surveillance-net
+    
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+networks:
+  surveillance-net:
+    driver: bridge

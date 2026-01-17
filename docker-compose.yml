@@ -1,0 +1,40 @@
+version: "3.8"
+
+services:
+  surveillance-bot:
+    build: .
+    container_name: synology-surveillance-bot-dev
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+    environment:
+      - SYNO_IP=${SYNO_IP:-192.168.1.10}
+      - SYNO_PORT=${SYNO_PORT:-5001}
+      - SYNO_USER=${SYNO_USER}
+      - SYNO_PASS=${SYNO_PASS}
+      - CAMERA_ID=${CAMERA_ID:-1}
+      - TG_TOKEN=${TG_TOKEN}
+      - TG_CHAT_ID=${TG_CHAT_ID}
+      - CHECK_INTERVAL=${CHECK_INTERVAL:-30}
+      - LOOKBACK_MINUTES=${LOOKBACK_MINUTES:-5}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - STATE_FILE=/data/state.json
+      - SSL_VERIFY=${SSL_VERIFY:-false}
+
+    volumes:
+      - ./data:/data:rw
+      - ./src:/app/src:ro
+
+    networks:
+      - surveillance-net
+
+    # Для разработки: монтируем исходники и логируем в консоль
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  surveillance-net:
+    driver: bridge
