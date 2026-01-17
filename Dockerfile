@@ -7,23 +7,23 @@ WORKDIR /app
 COPY requirements.txt .
 
 # Создаем виртуальное окружение и устанавливаем зависимости
-RUN python -m venv /opt/venv &&
-    /opt/venv/bin/pip install --no-cache-dir --upgrade pip &&
+RUN python -m venv /opt/venv && \
+    /opt/venv/bin/pip install --no-cache-dir --upgrade pip && \
     /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
 
 # Этап 2: Финальный образ
 FROM python:3.11-slim-bookworm
 
 # Устанавливаем системные зависимости для healthcheck и безопасности
-RUN apt-get update &&
+RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         curl \
         ca-certificates \
-        tzdata &&
+        tzdata && \
     rm -rf /var/lib/apt/lists/*
 
 # Создаем непривилегированного пользователя
-RUN groupadd -r appuser &&
+RUN groupadd -r appuser && \
     useradd -r -g appuser -u 1000 -m -s /bin/bash appuser
 
 # Копируем виртуальное окружение из builder
@@ -36,7 +36,7 @@ COPY entrypoint.sh /app/
 
 # Настройка рабочей директории и прав
 WORKDIR /app
-RUN chown -R appuser:appuser /app &&
+RUN chown -R appuser:appuser /app && \ 
     chmod +x /app/entrypoint.sh
 
 # Настройка переменных окружения
