@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Surveillance Station to Telegram Bot
-Исправленная версия с корректной обработкой времени и длительности видео
+Исправленная версия с корректной обработкой времени и отправкой видео
 """
 
 import os
@@ -257,128 +257,88 @@ class SynologyAPI:
             # Параметры скачивания как в старом работающем коде
             download_url = f"{self.base_url}/temp.mp4"
 
-            # Пробуем разные варианты скачивания
-            params_variants = [
-                # Вариант 1: как в старом коде (фрагмент)
-                {
-                    "api": "SYNO.SurveillanceStation.Recording",
-                    "method": "Download",
-                    "version": "6",
-                    "_sid": self.sid,
-                    "id": recording.id,
-                    "mountId": "0",
-                    "offsetTimeMs": "0",
-                    "playTimeMs": "10000",  # 10 секунд как в старом коде
-                },
-                # Вариант 2: пробуем скачать целиком (без ограничения времени)
-                {
-                    "api": "SYNO.SurveillanceStation.Recording",
-                    "method": "Download",
-                    "version": "1",
-                    "_sid": self.sid,
-                    "id": recording.id,
-                    "mountId": "0",
-                },
-                # Вариант 3: с использованием длительности записи
-                {
-                    "api": "SYNO.SurveillanceStation.Recording",
-                    "method": "Download",
-                    "version": "6",
-                    "_sid": self.sid,
-                    "id": recording.id,
-                    "mountId": "0",
-                    "offsetTimeMs": "0",
-                    "playTimeMs": (
-                        str(recording.duration) if recording.duration > 0 else "30000"
-                    ),
-                },
-            ]
+            # Пробуем разные варианты скачивания - используем только вариант 1, который работает
+            params = {
+                "api": "SYNO.SurveillanceStation.Recording",
+                "method": "Download",
+                "version": "6",
+                "_sid": self.sid,
+                "id": recording.id,
+                "mountId": "0",
+                "offsetTimeMs": "0",
+                "playTimeMs": "10000",  # 10 секунд как в старом коде - РАБОТАЕТ!
+            }
 
-            for i, params in enumerate(params_variants):
-                try:
-                    logger.info(
-                        f"📥 Пробуем скачивание (вариант {i+1}) записи {recording.id}"
-                    )
+            logger.info(f"📥 Скачиваю запись {recording.id} (вариант 1)")
 
-                    response = self.session.get(
-                        download_url, params=params, stream=True, timeout=120
-                    )
-                    response.raise_for_status()
-
-                    # Проверяем Content-Type
-                    content_type = response.headers.get("Content-Type", "")
-                    if "video" not in content_type and "mp4" not in content_type:
-                        logger.warning(f"⚠️ Неожиданный Content-Type: {content_type}")
-
-                    # Скачиваем файл
-                    total_size = int(response.headers.get("content-length", 0))
-                    downloaded = 0
-
-                    with open(temp_file.name, "wb") as f:
-                        for chunk in response.iter_content(chunk_size=8192):
-                            if chunk:
-                                f.write(chunk)
-                                downloaded += len(chunk)
-
-                    # Проверяем, что файл не пустой
-                    file_size = os.path.getsize(temp_file.name)
-                    if (
-                        file_size > 10 * 1024
-                    ):  # Минимум 10KB (чтобы исключить пустые файлы)
-                        logger.info(
-                            f"✅ Запись {recording.id} скачана, "
-                            f"размер: {file_size/(1024*1024):.1f} МБ (вариант {i+1})"
-                        )
-
-                        # Дополнительная проверка: пытаемся определить длительность видео
-                        if file_size > 100 * 1024:  # Если файл больше 100KB
-                            try:
-                                # Простая проверка: читаем первые байты файла
-                                with open(temp_file.name, "rb") as f:
-                                    header = f.read(100)
-                                    # Проверяем сигнатуры MP4
-                                    if b"ftyp" in header or b"moov" in header:
-                                        logger.debug(
-                                            f"✅ Файл похож на MP4 (найдены сигнатуры)"
-                                        )
-                                    else:
-                                        logger.warning(
-                                            f"⚠️ Файл может быть не видео (отсутствуют MP4 сигнатуры)"
-                                        )
-                            except:
-                                pass
-
-                        return temp_file.name
-                    else:
-                        logger.warning(
-                            f"⚠️ Файл слишком маленький ({file_size} байт), пробуем следующий вариант"
-                        )
-                        os.remove(temp_file.name)
-
-                except Exception as e:
-                    logger.debug(f"❌ Вариант {i+1} не сработал: {e}")
-                    if os.path.exists(temp_file.name):
-                        os.remove(temp_file.name)
-                    continue
-
-            logger.error(
-                f"❌ Ни один вариант скачивания не сработал для записи {recording.id}"
+            response = self.session.get(
+                download_url, params=params, stream=True, timeout=120
             )
-            return None
+            response.raise_for_status()
+
+            # Проверяем Content-Type
+            content_type = response.headers.get("Content-Type", "")
+            if "video" not in content_type and "mp4" not in content_type:
+                logger.warning(f"⚠️ Неожиданный Content-Type: {content_type}")
+
+            # Скачиваем файл
+            total_size = int(response.headers.get("content-length", 0))
+            downloaded = 0
+
+            with open(temp_file.name, "wb") as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+
+            # Проверяем, что файл не пустой
+            file_size = os.path.getsize(temp_file.name)
+            if file_size > 10 * 1024:  # Минимум 10KB (чтобы исключить пустые файлы)
+                logger.info(
+                    f"✅ Запись {recording.id} скачана, размер: {file_size/(1024*1024):.1f} МБ"
+                )
+
+                # Дополнительная проверка: пытаемся определить длительность видео
+                if file_size > 100 * 1024:  # Если файл больше 100KB
+                    try:
+                        # Простая проверка: читаем первые байты файла
+                        with open(temp_file.name, "rb") as f:
+                            header = f.read(100)
+                            # Проверяем сигнатуры MP4
+                            if b"ftyp" in header or b"moov" in header:
+                                logger.debug(
+                                    f"✅ Файл похож на MP4 (найдены сигнатуры)"
+                                )
+                            else:
+                                logger.warning(
+                                    f"⚠️ Файл может быть не видео (отсутствуют MP4 сигнатуры)"
+                                )
+                    except:
+                        pass
+
+                return temp_file.name
+            else:
+                logger.warning(f"⚠️ Файл слишком маленький ({file_size} байт)")
+                if os.path.exists(temp_file.name):
+                    os.remove(temp_file.name)
+                return None
 
         except RequestException as e:
             logger.error(f"❌ Ошибка скачивания записи {recording.id}: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"❌ Неожиданная ошибка при скачивании: {e}")
-            return None
-        finally:
-            # Убеждаемся, что временный файл удален в случае ошибки
             if temp_file and os.path.exists(temp_file.name):
                 try:
                     os.remove(temp_file.name)
                 except:
                     pass
+            return None
+        except Exception as e:
+            logger.error(f"❌ Неожиданная ошибка при скачивании: {e}")
+            if temp_file and os.path.exists(temp_file.name):
+                try:
+                    os.remove(temp_file.name)
+                except:
+                    pass
+            return None
 
     def get_camera_name(self, camera_id: str) -> str:
         """Получает имя камеры по ID"""
@@ -430,7 +390,7 @@ class TelegramBot:
         stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=5)
     )
     def send_video(self, video_path: str, caption: str = "") -> bool:
-        """Отправляет видео в Telegram"""
+        """Отправляет видео в Telegram - ИСПРАВЛЕННАЯ ВЕРСИЯ"""
         try:
             # Проверяем размер файла
             file_size = os.path.getsize(video_path)
@@ -461,14 +421,29 @@ class TelegramBot:
                     data=data,
                     timeout=60,  # Увеличиваем таймаут для больших файлов
                 )
-                response.raise_for_status()
 
-            logger.info("✅ Видео отправлено в Telegram")
-            return True
+                # Логируем ответ от Telegram для отладки
+                logger.debug(f"📤 Ответ Telegram API: {response.status_code}")
+
+                if response.status_code != 200:
+                    logger.error(
+                        f"❌ Telegram API вернул ошибку: {response.status_code} - {response.text}"
+                    )
+                    return False
+
+                response.raise_for_status()
+                result = response.json()
+
+                if result.get("ok"):
+                    logger.info("✅ Видео успешно отправлено в Telegram")
+                    return True
+                else:
+                    logger.error(f"❌ Ошибка Telegram API: {result}")
+                    return False
 
         except Exception as e:
             logger.error(f"❌ Ошибка отправки видео: {e}")
-            raise
+            return False
 
 
 class StateManager:
@@ -512,6 +487,7 @@ class StateManager:
     def save_state(self) -> None:
         """Сохраняет состояние в файл"""
         if not self.is_writable:
+            logger.debug("⚠️ Состояние не сохраняется (файл недоступен для записи)")
             return
 
         try:
@@ -527,7 +503,9 @@ class StateManager:
             with open(self.state_file, "w") as f:
                 json.dump(state, f, indent=2, ensure_ascii=False)
 
-            logger.debug("💾 Состояние сохранено")
+            logger.debug(
+                f"💾 Состояние сохранено. Обработано записей: {len(self.processed_ids)}"
+            )
         except Exception as e:
             logger.error(f"❌ Ошибка сохранения состояния: {e}")
             self.is_writable = False
@@ -540,6 +518,9 @@ class StateManager:
         """Помечает запись как обработанную"""
         self.processed_ids.add(recording_id)
         self.last_processed_time = int(time.time())
+        logger.debug(f"📝 Запись {recording_id} помечена как обработанная")
+        # Немедленно сохраняем состояние после пометки
+        self.save_state()
 
     def cleanup_old_records(self, max_age_days: int = 7) -> None:
         """Очищает старые записи из состояния"""
@@ -665,6 +646,7 @@ def main():
             for recording in recordings:
                 # Пропускаем уже обработанные
                 if state.is_processed(recording.id):
+                    logger.debug(f"⏭️  Запись {recording.id} уже обработана, пропускаю")
                     continue
 
                 # Пропускаем записи с нулевой или отрицательной длительностью
@@ -698,6 +680,7 @@ def main():
                         caption = format_caption(recording, camera_name)
 
                         # Отправляем в Telegram
+                        logger.info(f"📨 Отправляю запись {recording.id} в Telegram...")
                         if telegram.send_video(video_path, caption):
                             state.mark_processed(recording.id)
                             new_recordings += 1
@@ -706,7 +689,7 @@ def main():
                             )
                         else:
                             logger.error(
-                                f"❌ Не удалось отправить запись {recording.id}"
+                                f"❌ Не удалось отправить запись {recording.id} в Telegram"
                             )
 
                         # Удаляем временный файл
@@ -736,6 +719,7 @@ def main():
             state.save_state()
 
             # Ждем следующей проверки
+            logger.debug(f"⏳ Следующая проверка через {check_interval} секунд...")
             for i in range(check_interval):
                 if shutdown_requested:
                     break
