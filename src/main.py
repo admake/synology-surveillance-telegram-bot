@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Surveillance Station to Telegram Bot
-Исправленная версия с загрузкой полных видеозаписей
+Версия с обработкой событий в реальном времени
 """
 
 import os
@@ -157,7 +157,11 @@ class SynologyAPI:
         stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=5)
     )
     def get_recordings(
-        self, camera_id: Optional[str] = None, limit: int = 10
+        self,
+        camera_id: Optional[str] = None,
+        limit: int = 10,
+        from_time: Optional[int] = None,
+        to_time: Optional[int] = None,
     ) -> List[Recording]:
         """Получаем список записей с детальной информацией"""
         if not self.ensure_session():
@@ -165,8 +169,13 @@ class SynologyAPI:
 
         try:
             current_time = int(time.time())
-            from_time = current_time - 3600
-            to_time = current_time
+
+            # Если временные границы не указаны, используем последние 2 минуты
+            # для поиска новых событий в реальном времени
+            if from_time is None:
+                from_time = current_time - 120  # 2 минуты назад
+            if to_time is None:
+                to_time = current_time
 
             params = {
                 "api": "SYNO.SurveillanceStation.Recording",
@@ -245,7 +254,9 @@ class SynologyAPI:
                         )
                         continue
 
-                logger.info(f"🎥 Получено {len(recordings)} записей за последний час")
+                logger.info(
+                    f"🎥 Получено {len(recordings)} записей за период {datetime.fromtimestamp(from_time).strftime('%H:%M:%S')} - {datetime.fromtimestamp(to_time).strftime('%H:%M:%S')}"
+                )
                 return recordings
 
             error_code = data.get("error", {}).get("code", "unknown")
@@ -662,6 +673,7 @@ class StateManager:
         self.state_file = Path(state_file)
         self.processed_ids = set()
         self.last_processed_time = 0
+        self.last_check_time = 0  # Время последней проверки
         self.total_processed = 0
         self.is_writable = True
 
@@ -672,6 +684,7 @@ class StateManager:
             logger.warning("⚠️ Состояние не будет сохраняться между запусками")
             self.is_writable = False
             self.last_processed_time = int(time.time() - 3600)
+            self.last_check_time = int(time.time() - 120)  # 2 минуты назад
 
     def load_state(self) -> None:
         """Загружает состояние из файла"""
@@ -681,6 +694,9 @@ class StateManager:
                     state = json.load(f)
                     self.processed_ids = set(state.get("processed_ids", []))
                     self.last_processed_time = state.get("last_processed_time", 0)
+                    self.last_check_time = state.get(
+                        "last_check_time", int(time.time() - 120)
+                    )
                     self.total_processed = state.get(
                         "total_processed", len(self.processed_ids)
                     )
@@ -694,6 +710,7 @@ class StateManager:
         except Exception as e:
             logger.warning(f"⚠️ Не удалось загрузить состояние: {e}")
             self.last_processed_time = int(time.time() - 3600)
+            self.last_check_time = int(time.time() - 120)
 
     def save_state(self) -> None:
         """Сохраняет состояние в файл"""
@@ -705,6 +722,7 @@ class StateManager:
             state = {
                 "processed_ids": list(self.processed_ids),
                 "last_processed_time": self.last_processed_time,
+                "last_check_time": self.last_check_time,
                 "total_processed": self.total_processed,
                 "updated_at": datetime.now().isoformat(),
                 "container_started": os.getenv(
@@ -718,7 +736,7 @@ class StateManager:
                 json.dump(state, f, indent=2, ensure_ascii=False)
 
             logger.debug(
-                f"💾 Состояние сохранено. Всего обработано: {self.total_processed}"
+                f"💾 Состояние сохранено. Время последней проверки: {datetime.fromtimestamp(self.last_check_time).strftime('%H:%M:%S')}"
             )
         except Exception as e:
             logger.error(f"❌ Ошибка сохранения состояния: {e}")
@@ -734,6 +752,11 @@ class StateManager:
         self.last_processed_time = int(time.time())
         self.total_processed += 1
         logger.debug(f"📝 Запись {recording_id} помечена как обработанная")
+        self.save_state()
+
+    def update_check_time(self, check_time: int) -> None:
+        """Обновляет время последней проверки"""
+        self.last_check_time = check_time
         self.save_state()
 
     def cleanup_old_records(self, max_age_days: int = 7) -> None:
@@ -755,6 +778,14 @@ class StateManager:
                     "%Y-%m-%d %H:%M:%S"
                 )
                 if self.last_processed_time > 0
+                else "никогда"
+            ),
+            "last_check_time": self.last_check_time,
+            "last_check_human": (
+                datetime.fromtimestamp(self.last_check_time).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+                if self.last_check_time > 0
                 else "никогда"
             ),
         }
@@ -839,8 +870,9 @@ def send_startup_message(
         f"<b>🔄 Интервал проверки:</b> {check_interval} сек\n"
         f"<b>📊 Всего обработано:</b> {stats['total_processed']} записей\n"
         f"<b>⏰ Последняя обработка:</b> {stats['last_processed_human']}\n"
+        f"<b>⏱️ Последняя проверка:</b> {stats['last_check_human']}\n"
         f"<b>📹 Режим:</b> Отправка полных записей\n\n"
-        f"<i>Бот активен и мониторит события движения...</i>"
+        f"<i>Бот активен и мониторит события движения в реальном времени...</i>"
     )
 
     if bot.send_message(message):
@@ -873,7 +905,7 @@ def send_shutdown_message(
 
 def main():
     """Основная функция приложения"""
-    logger.info("🚀 Запуск Surveillance Station Telegram Bot (режим полных записей)")
+    logger.info("🚀 Запуск Surveillance Station Telegram Bot (режим реального времени)")
 
     os.environ["CONTAINER_START_TIME"] = datetime.now().isoformat()
     start_time = time.time()
@@ -893,12 +925,13 @@ def main():
     camera_id = os.getenv("CAMERA_ID", "5")
     camera_name = synology.get_camera_name(camera_id)
 
-    check_interval = int(os.getenv("CHECK_INTERVAL", "30"))
+    check_interval = int(os.getenv("CHECK_INTERVAL", "10"))  # Уменьшено до 10 секунд
 
     send_startup_message(telegram, camera_name, camera_id, state, check_interval)
 
     logger.info(f"👁️  Мониторинг камеры: {camera_name} (ID: {camera_id})")
-    logger.info("📹 Режим: отправка полных записей событий")
+    logger.info("📹 Режим: мониторинг событий в реальном времени")
+    logger.info(f"🔄 Интервал проверки: {check_interval} секунд")
 
     shutdown_requested = False
     new_recordings_session = 0
@@ -911,21 +944,57 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
 
-    logger.info("🔄 Начинаю мониторинг записей...")
+    logger.info("🔄 Начинаю мониторинг записей в реальном времени...")
 
     while not shutdown_requested:
         try:
-            recordings = synology.get_recordings(camera_id=camera_id, limit=20)
+            current_time = int(time.time())
+
+            # Определяем временной диапазон для поиска новых записей
+            # Ищем записи с момента последней проверки (но не более 5 минут назад)
+            from_time = (
+                state.last_check_time
+                if state.last_check_time > 0
+                else current_time - 300
+            )
+
+            # Для предотвращения пропуска записей добавляем небольшой буфер (5 секунд)
+            if from_time > 0:
+                from_time = max(from_time - 5, current_time - 300)
+
+            to_time = current_time
+
+            logger.debug(
+                f"🔍 Поиск записей за период: {datetime.fromtimestamp(from_time).strftime('%H:%M:%S')} - {datetime.fromtimestamp(to_time).strftime('%H:%M:%S')}"
+            )
+
+            # Получаем записи за последний период
+            recordings = synology.get_recordings(
+                camera_id=camera_id, limit=20, from_time=from_time, to_time=to_time
+            )
+
+            # Обновляем время последней проверки
+            state.update_check_time(current_time)
+
+            # Фильтруем уже обработанные записи
             pending_recordings = [r for r in recordings if not state.is_processed(r.id)]
 
             if pending_recordings:
                 logger.info(
                     f"📋 Найдено {len(pending_recordings)} новых записей для обработки"
                 )
+                logger.info(
+                    f"📅 Период событий: {datetime.fromtimestamp(pending_recordings[-1].start_time).strftime('%H:%M:%S')} - {datetime.fromtimestamp(pending_recordings[0].start_time).strftime('%H:%M:%S')}"
+                )
 
-                for recording in reversed(pending_recordings):
+                # Обрабатываем записи в порядке от старых к новым (для хронологии)
+                for recording in pending_recordings:
+                    event_time = datetime.fromtimestamp(recording.start_time).strftime(
+                        "%H:%M:%S"
+                    )
                     logger.info(
                         f"🆕 Обрабатываю запись {recording.id}, "
+                        f"время события: {event_time}, "
                         f"длительность: {format_duration(recording.duration)}"
                     )
 
@@ -983,13 +1052,21 @@ def main():
                     f"📊 Обработка завершена. Обработано записей: {len(pending_recordings)}"
                 )
             else:
-                logger.debug("🔍 Новых записей не обнаружено")
-                logger.info(
-                    f"📊 Статистика: всего обработано {state.total_processed} записей"
+                logger.debug(
+                    f"🔍 Новых записей не обнаружено (проверка в {datetime.now().strftime('%H:%M:%S')})"
                 )
 
+                # Периодически выводим статистику
+                if int(time.time()) % 60 == 0:  # Каждую минуту
+                    logger.info(
+                        f"📊 Статистика: всего обработано {state.total_processed} записей, "
+                        f"последняя проверка: {datetime.fromtimestamp(state.last_check_time).strftime('%H:%M:%S')}"
+                    )
+
+            # Сохраняем состояние
             state.save_state()
 
+            # Ждем следующей проверки
             logger.debug(f"⏳ Следующая проверка через {check_interval} секунд...")
             for i in range(check_interval):
                 if shutdown_requested:
