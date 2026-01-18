@@ -1,4 +1,4 @@
-# Этап 1: Сборщик зависимостей
+# Базовый образ с Python 3.11
 FROM python:3.11-slim-bookworm AS builder
 
 WORKDIR /app
@@ -11,15 +11,13 @@ RUN python -m venv /opt/venv && \
     /opt/venv/bin/pip install --no-cache-dir --upgrade pip && \
     /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
 
-# Этап 2: Финальный образ
+# Финальный образ
 FROM python:3.11-slim-bookworm
 
-# Устанавливаем системные зависимости для healthcheck и безопасности
+# Устанавливаем curl для healthcheck
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        curl \
-        ca-certificates \
-        tzdata && \
+        curl && \
     rm -rf /var/lib/apt/lists/*
 
 # Создаем непривилегированного пользователя
@@ -36,7 +34,7 @@ COPY entrypoint.sh /app/
 
 # Настройка рабочей директории и прав
 WORKDIR /app
-RUN chown -R appuser:appuser /app && \ 
+RUN chown -R appuser:appuser /app && \
     chmod +x /app/entrypoint.sh
 
 # Настройка переменных окружения
