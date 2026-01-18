@@ -41,7 +41,7 @@ class Recording:
     id: str
     camera_id: str
     start_time: int  # Unix timestamp в секундах
-    duration: int  # Длительность в секундах
+    duration: int  # Длительность в миллисекундах
     size: int  # Размер в байтах
     file_path: Optional[str] = None
 
@@ -158,18 +158,21 @@ class SynologyAPI:
     def get_recordings(
         self, camera_id: Optional[str] = None, limit: int = 10
     ) -> List[Recording]:
-        """Получаем список записей"""
+        """Получаем список записей - РАБОЧАЯ ВЕРСИЯ из теста"""
         if not self.ensure_session():
             return []
 
         try:
+            # Рабочие параметры из теста: version=6, fromTime=0, toTime=0
             params = {
                 "api": "SYNO.SurveillanceStation.Recording",
                 "method": "List",
-                "version": "9",  # Используем версию 9 для получения полной информации
+                "version": "6",  # ← Рабочая версия из теста
                 "_sid": self.sid,
                 "offset": "0",
                 "limit": str(limit),
+                "fromTime": "0",  # ← 0 для получения последних записей
+                "toTime": "0",  # ← 0 для получения последних записей
             }
 
             if camera_id:
@@ -179,19 +182,40 @@ class SynologyAPI:
             response.raise_for_status()
 
             data = response.json()
+
             if data.get("success"):
                 recordings_data = data.get("data", {}).get("recordings", [])
+
+                # ДЛЯ ОТЛАДКИ: логируем первую запись, чтобы увидеть структуру
+                if recordings_data and logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        f"📋 Структура записи из API: {json.dumps(recordings_data[0], indent=2)}"
+                    )
 
                 recordings = []
                 for rec in recordings_data:
                     try:
-                        # Преобразуем данные в объект Recording
+                        # Обработка времени: некоторые записи могут не иметь startTime
+                        start_time = rec.get("startTime", 0)
+
+                        # Если время не указано, используем текущее время минус 1 час
+                        # (чтобы подпись в Telegram не была 1970 годом)
+                        if (
+                            start_time == 0 or start_time < 1000000000
+                        ):  # Проверяем на разумность timestamp
+                            start_time = int(time.time()) - 3600  # 1 час назад
+
+                        # Обработка длительности: может быть 0 в ответе
+                        duration = rec.get("duration", 0)
+                        if duration <= 0:
+                            # Если длительность не указана, ставим разумное значение
+                            duration = 10000  # 10 секунд по умолчанию
+
                         recording = Recording(
                             id=str(rec.get("id")),
                             camera_id=str(rec.get("cameraId", "unknown")),
-                            start_time=rec.get("startTime", 0),
-                            duration=rec.get("duration", 0)
-                            // 1000,  # Конвертируем мс в секунды
+                            start_time=start_time,
+                            duration=duration,  # В миллисекундах
                             size=rec.get("size", 0),
                         )
                         recordings.append(recording)
@@ -204,7 +228,8 @@ class SynologyAPI:
                 logger.info(f"🎥 Получено {len(recordings)} записей")
                 return recordings
 
-            logger.warning(f"⚠️ Нет записей или ошибка API: {data}")
+            error_code = data.get("error", {}).get("code", "unknown")
+            logger.warning(f"⚠️ Ошибка API (код {error_code}): {data}")
             return []
 
         except RequestException as e:
@@ -217,10 +242,11 @@ class SynologyAPI:
         stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10)
     )
     def download_full_recording(self, recording: Recording) -> Optional[str]:
-        """Скачивает полную запись целиком"""
+        """Скачивает запись целиком - АДАПТИРОВАННАЯ ВЕРСИЯ"""
         if not self.ensure_session():
             return None
 
+        temp_file = None
         try:
             # Создаем временный файл
             temp_file = tempfile.NamedTemporaryFile(
@@ -228,70 +254,131 @@ class SynologyAPI:
             )
             temp_file.close()
 
-            # Скачиваем всю запись (без параметров offsetTimeMs и playTimeMs)
+            # Параметры скачивания как в старом работающем коде
             download_url = f"{self.base_url}/temp.mp4"
-            params = {
-                "api": "SYNO.SurveillanceStation.Recording",
-                "method": "Download",
-                "version": "1",  # Самая простая версия для скачивания целиком
-                "_sid": self.sid,
-                "id": recording.id,
-            }
 
-            logger.info(
-                f"📥 Начинаю скачивание записи {recording.id} "
-                f"(длительность: {recording.duration} сек, "
-                f"размер: {recording.size / (1024*1024):.1f} МБ)"
+            # Пробуем разные варианты скачивания
+            params_variants = [
+                # Вариант 1: как в старом коде (фрагмент)
+                {
+                    "api": "SYNO.SurveillanceStation.Recording",
+                    "method": "Download",
+                    "version": "6",
+                    "_sid": self.sid,
+                    "id": recording.id,
+                    "mountId": "0",
+                    "offsetTimeMs": "0",
+                    "playTimeMs": "10000",  # 10 секунд как в старом коде
+                },
+                # Вариант 2: пробуем скачать целиком (без ограничения времени)
+                {
+                    "api": "SYNO.SurveillanceStation.Recording",
+                    "method": "Download",
+                    "version": "1",
+                    "_sid": self.sid,
+                    "id": recording.id,
+                    "mountId": "0",
+                },
+                # Вариант 3: с использованием длительности записи
+                {
+                    "api": "SYNO.SurveillanceStation.Recording",
+                    "method": "Download",
+                    "version": "6",
+                    "_sid": self.sid,
+                    "id": recording.id,
+                    "mountId": "0",
+                    "offsetTimeMs": "0",
+                    "playTimeMs": (
+                        str(recording.duration) if recording.duration > 0 else "30000"
+                    ),
+                },
+            ]
+
+            for i, params in enumerate(params_variants):
+                try:
+                    logger.info(
+                        f"📥 Пробуем скачивание (вариант {i+1}) записи {recording.id}"
+                    )
+
+                    response = self.session.get(
+                        download_url, params=params, stream=True, timeout=120
+                    )
+                    response.raise_for_status()
+
+                    # Проверяем Content-Type
+                    content_type = response.headers.get("Content-Type", "")
+                    if "video" not in content_type and "mp4" not in content_type:
+                        logger.warning(f"⚠️ Неожиданный Content-Type: {content_type}")
+
+                    # Скачиваем файл
+                    total_size = int(response.headers.get("content-length", 0))
+                    downloaded = 0
+
+                    with open(temp_file.name, "wb") as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                                downloaded += len(chunk)
+
+                    # Проверяем, что файл не пустой
+                    file_size = os.path.getsize(temp_file.name)
+                    if (
+                        file_size > 10 * 1024
+                    ):  # Минимум 10KB (чтобы исключить пустые файлы)
+                        logger.info(
+                            f"✅ Запись {recording.id} скачана, "
+                            f"размер: {file_size/(1024*1024):.1f} МБ (вариант {i+1})"
+                        )
+
+                        # Дополнительная проверка: пытаемся определить длительность видео
+                        if file_size > 100 * 1024:  # Если файл больше 100KB
+                            try:
+                                # Простая проверка: читаем первые байты файла
+                                with open(temp_file.name, "rb") as f:
+                                    header = f.read(100)
+                                    # Проверяем сигнатуры MP4
+                                    if b"ftyp" in header or b"moov" in header:
+                                        logger.debug(
+                                            f"✅ Файл похож на MP4 (найдены сигнатуры)"
+                                        )
+                                    else:
+                                        logger.warning(
+                                            f"⚠️ Файл может быть не видео (отсутствуют MP4 сигнатуры)"
+                                        )
+                            except:
+                                pass
+
+                        return temp_file.name
+                    else:
+                        logger.warning(
+                            f"⚠️ Файл слишком маленький ({file_size} байт), пробуем следующий вариант"
+                        )
+                        os.remove(temp_file.name)
+
+                except Exception as e:
+                    logger.debug(f"❌ Вариант {i+1} не сработал: {e}")
+                    if os.path.exists(temp_file.name):
+                        os.remove(temp_file.name)
+                    continue
+
+            logger.error(
+                f"❌ Ни один вариант скачивания не сработал для записи {recording.id}"
             )
-
-            response = self.session.get(
-                download_url,
-                params=params,
-                stream=True,
-                timeout=120,  # Увеличиваем таймаут для больших файлов
-            )
-            response.raise_for_status()
-
-            # Скачиваем с прогрессом
-            total_size = int(response.headers.get("content-length", 0))
-            downloaded = 0
-
-            with open(temp_file.name, "wb") as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
-
-                        # Логируем прогресс каждые 5 МБ
-                        if total_size > 0 and downloaded % (5 * 1024 * 1024) < 8192:
-                            percent = (downloaded / total_size) * 100
-                            logger.debug(
-                                f"📥 Прогресс скачивания: {percent:.1f}% "
-                                f"({downloaded/(1024*1024):.1f} МБ / {total_size/(1024*1024):.1f} МБ)"
-                            )
-
-            # Проверяем размер скачанного файла
-            file_size = os.path.getsize(temp_file.name)
-            logger.info(
-                f"✅ Запись {recording.id} скачана, размер: {file_size/(1024*1024):.1f} МБ"
-            )
-
-            return temp_file.name
+            return None
 
         except RequestException as e:
             logger.error(f"❌ Ошибка скачивания записи {recording.id}: {e}")
-
-            # Удаляем частично скачанный файл
-            try:
-                if os.path.exists(temp_file.name):
-                    os.remove(temp_file.name)
-            except:
-                pass
-
-            raise
+            return None
         except Exception as e:
             logger.error(f"❌ Неожиданная ошибка при скачивании: {e}")
-            raise
+            return None
+        finally:
+            # Убеждаемся, что временный файл удален в случае ошибки
+            if temp_file and os.path.exists(temp_file.name):
+                try:
+                    os.remove(temp_file.name)
+                except:
+                    pass
 
     def get_camera_name(self, camera_id: str) -> str:
         """Получает имя камеры по ID"""
@@ -391,7 +478,16 @@ class StateManager:
         self.state_file = Path(state_file)
         self.processed_ids = set()
         self.last_processed_time = 0
-        self.load_state()
+        self.is_writable = True
+
+        try:
+            self.load_state()
+        except PermissionError as e:
+            logger.warning(f"⚠️ Не удалось загрузить состояние: {e}")
+            logger.warning("⚠️ Состояние не будет сохраняться между запусками")
+            self.is_writable = False
+            # Используем начальные значения
+            self.last_processed_time = int(time.time() - 3600)
 
     def load_state(self) -> None:
         """Загружает состояние из файла"""
@@ -415,6 +511,9 @@ class StateManager:
 
     def save_state(self) -> None:
         """Сохраняет состояние в файл"""
+        if not self.is_writable:
+            return
+
         try:
             state = {
                 "processed_ids": list(self.processed_ids),
@@ -431,6 +530,7 @@ class StateManager:
             logger.debug("💾 Состояние сохранено")
         except Exception as e:
             logger.error(f"❌ Ошибка сохранения состояния: {e}")
+            self.is_writable = False
 
     def is_processed(self, recording_id: str) -> bool:
         """Проверяет, была ли запись обработана"""
@@ -470,24 +570,36 @@ def format_duration(seconds: int) -> str:
 
 
 def format_caption(recording: Recording, camera_name: str) -> str:
-    """Форматирует подпись для Telegram"""
+    """Форматирует подпись для Telegram с обработкой отсутствующих данных"""
     try:
-        # Преобразуем timestamp в читаемое время
-        start_time = datetime.fromtimestamp(recording.start_time)
+        # Если время невалидное (например, 1970 год), используем текущее время
+        if recording.start_time < 1000000000:  # timestamp до 2001 года
+            start_time = datetime.now()
+            time_source = " (время приблизительное)"
+        else:
+            start_time = datetime.fromtimestamp(recording.start_time)
+            time_source = ""
 
         # Форматируем дату и время
         time_str = start_time.strftime("%d.%m.%Y %H:%M:%S")
 
         # Форматируем длительность
-        duration_str = format_duration(recording.duration)
+        if recording.duration > 0:
+            duration_sec = recording.duration / 1000  # Конвертируем мс в секунды
+            duration_str = format_duration(int(duration_sec))
+        else:
+            duration_str = "длительность неизвестна"
 
         # Форматируем размер
         size_mb = recording.size / (1024 * 1024)
-        size_str = f"{size_mb:.1f} МБ" if size_mb > 0 else "размер неизвестен"
+        if size_mb > 0.1:  # Если размер больше 100KB
+            size_str = f"{size_mb:.1f} МБ"
+        else:
+            size_str = "размер неизвестен"
 
         # Создаем подпись
         caption = (
-            f"<b>🎥 Движение обнаружено</b>\n\n"
+            f"<b>🎥 Движение обнаружено</b>{time_source}\n\n"
             f"<b>📷 Камера:</b> {camera_name}\n"
             f"<b>🕐 Время:</b> {time_str}\n"
             f"<b>⏱️ Длительность:</b> {duration_str}\n"
@@ -499,7 +611,7 @@ def format_caption(recording: Recording, camera_name: str) -> str:
 
     except Exception as e:
         logger.error(f"❌ Ошибка форматирования подписи: {e}")
-        return "🎥 Обнаружено движение"
+        return f"🎥 Обнаружено движение\n📷 Камера: {camera_name}"
 
 
 def main():
@@ -545,10 +657,9 @@ def main():
 
     while not shutdown_requested:
         try:
-            # Получаем новые записи
+            # Получаем новые записи с увеличенным лимитом
             recordings = synology.get_recordings(camera_id=camera_id, limit=20)
 
-            # Обрабатываем записи в порядке от старых к новым
             new_recordings = 0
 
             for recording in recordings:
@@ -556,23 +667,33 @@ def main():
                 if state.is_processed(recording.id):
                     continue
 
-                # Пропускаем записи без длительности
+                # Пропускаем записи с нулевой или отрицательной длительностью
                 if recording.duration <= 0:
-                    logger.warning(
-                        f"⚠️ Пропускаю запись {recording.id} без длительности"
+                    logger.debug(
+                        f"⚠️ Пропускаю запись {recording.id} с нулевой длительностью"
                     )
                     continue
 
                 logger.info(
                     f"🆕 Новая запись: ID={recording.id}, "
-                    f"длительность={format_duration(recording.duration)}"
+                    f"время={datetime.fromtimestamp(recording.start_time).strftime('%H:%M:%S')}, "
+                    f"длительность={format_duration(recording.duration // 1000)}"
                 )
 
                 try:
-                    # Скачиваем полную запись
+                    # Скачиваем запись
                     video_path = synology.download_full_recording(recording)
 
-                    if video_path:
+                    if video_path and os.path.exists(video_path):
+                        # Проверяем размер файла
+                        file_size = os.path.getsize(video_path)
+                        if file_size < 10 * 1024:  # Меньше 10KB - скорее всего ошибка
+                            logger.warning(
+                                f"⚠️ Файл слишком маленький ({file_size} байт), пропускаю"
+                            )
+                            os.remove(video_path)
+                            continue
+
                         # Формируем подпись
                         caption = format_caption(recording, camera_name)
 
@@ -580,16 +701,27 @@ def main():
                         if telegram.send_video(video_path, caption):
                             state.mark_processed(recording.id)
                             new_recordings += 1
-                            logger.info(f"✅ Запись {recording.id} успешно обработана")
+                            logger.info(
+                                f"✅ Запись {recording.id} успешно обработана и отправлена"
+                            )
+                        else:
+                            logger.error(
+                                f"❌ Не удалось отправить запись {recording.id}"
+                            )
 
                         # Удаляем временный файл
                         try:
                             os.remove(video_path)
                         except Exception as e:
-                            logger.warning(f"⚠️ Не удалось удалить временный файл: {e}")
+                            logger.warning(
+                                f"⚠️ Не удалось удалить временный файл {video_path}: {e}"
+                            )
+                    else:
+                        logger.error(f"❌ Не удалось скачать запись {recording.id}")
 
                 except Exception as e:
                     logger.error(f"❌ Ошибка обработки записи {recording.id}: {e}")
+                    # Продолжаем со следующей записью
 
                 # Проверяем флаг shutdown
                 if shutdown_requested:
@@ -597,6 +729,8 @@ def main():
 
             if new_recordings > 0:
                 logger.info(f"📊 Обработано новых записей: {new_recordings}")
+            else:
+                logger.debug("🔍 Новых записей не обнаружено")
 
             # Сохраняем состояние
             state.save_state()
