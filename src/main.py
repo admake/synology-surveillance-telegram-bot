@@ -1,178 +1,168 @@
 #!/usr/bin/env python3
 """
-Surveillance Station to Telegram Bot
-Надежная отправка видео с событий движения в Telegram
+Адаптированная версия на основе работающего кода из старого контейнера
 """
 
 import os
 import json
 import time
-import signal
 import logging
-from datetime import datetime, timedelta
+import signal
+from datetime import datetime
 from pathlib import Path
 
 import requests
-from tenacity import (
-    retry,
-    stop_after_attempt,
-    wait_exponential,
-    retry_if_exception_type,
-)
 from requests.exceptions import RequestException
+import telebot
 
-# Настройка структурированного логирования
-log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+# Настройка логирования
 logging.basicConfig(
-    level=getattr(logging, log_level),
+    level=os.getenv("LOG_LEVEL", "INFO"),
     format='{"time": "%(asctime)s", "level": "%(levelname)s", "module": "%(name)s", "message": "%(message)s"}',
     datefmt="%Y-%m-%dT%H:%M:%S%z",
 )
 logger = logging.getLogger(__name__)
 
 
-class SynologyAPI:
-    """Клиент для работы с API Synology Surveillance Station"""
+class SynologySurveillance:
+    """Класс для работы с Surveillance Station API (адаптированный)"""
 
     def __init__(self):
-        self.base_url = (
-            f"https://{os.getenv('SYNO_IP')}:{os.getenv('SYNO_PORT', '5001')}/webapi"
-        )
+        self.syno_ip = os.getenv("SYNO_IP")
+        self.syno_port = os.getenv("SYNO_PORT", "5001")
+        self.syno_login = os.getenv("SYNO_USER")
+        self.syno_pass = os.getenv("SYNO_PASS")
+        self.syno_otp = os.getenv("SYNO_OTP", None)
+
+        self.base_url = f"https://{self.syno_ip}:{self.syno_port}/webapi/entry.cgi"
         self.session = requests.Session()
         self.session.verify = os.getenv("SSL_VERIFY", "false").lower() == "true"
+
         self.sid = None
-        self.last_login = None
+        self.config_file = os.getenv("STATE_FILE", "/data/state.json")
+        self.cameras_config = {}
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=4, max=10),
-        retry=retry_if_exception_type(RequestException),
-    )
     def login(self):
-        """Аутентификация в API Synology"""
+        """Аутентификация в Surveillance Station"""
         try:
-            auth_url = f"{self.base_url}/auth.cgi"
-
-            # Первый шаг: получение sid
             params = {
                 "api": "SYNO.API.Auth",
-                "method": "login",
                 "version": "7",
-                "account": os.getenv("SYNO_USER"),
-                "passwd": os.getenv("SYNO_PASS"),
+                "method": "login",
+                "account": self.syno_login,
+                "passwd": self.syno_pass,
                 "session": "SurveillanceStation",
-                "format": "sid",
+                "format": "cookie",
             }
 
-            response = self.session.get(auth_url, params=params, timeout=10)
-            response.raise_for_status()
+            if self.syno_otp:
+                params["otp_code"] = self.syno_otp
 
+            response = self.session.get(self.base_url, params=params, timeout=10)
             data = response.json()
+
             if data.get("success"):
                 self.sid = data["data"]["sid"]
-                self.last_login = time.time()
-                logger.info("Successfully authenticated to Synology API")
+                logger.info(f"Authentication successful. SID: {self.sid[:15]}...")
+
+                # Сохраняем конфигурацию камер
+                self.save_cameras_config()
                 return True
+            else:
+                logger.error(f"Authentication failed: {data}")
+                return False
 
-            logger.error(f"Authentication failed: {data}")
+        except Exception as e:
+            logger.error(f"Login error: {e}")
             return False
 
-        except RequestException as e:
-            logger.error(f"Network error during authentication: {e}")
-            raise
-
-    def is_session_valid(self):
-        """Проверяет валидность текущей сессии"""
-        if not self.sid or not self.last_login:
-            return False
-        # Сессия истекает через 10 минут
-        return (time.time() - self.last_login) < 600
-
-    # В файле src/surveillance_bot.py найдите функцию get_events и ЗАМЕНИТЕ её:
-
-    @retry(
-        stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=5)
-    )
-    def get_events(self, start_time, end_time, camera_id=None):
-        """Получает список событий движения - ИСПРАВЛЕННАЯ ВЕРСИЯ"""
-        if not self.is_session_valid():
-            self.login()
-
+    def save_cameras_config(self):
+        """Получает и сохраняет конфигурацию камер"""
         try:
-            # Используем правильный endpoint и версию API
-            event_url = f"{self.base_url}/webapi/entry.cgi"
-
-            # БАЗОВЫЕ параметры для версии 9 (которая работает)
             params = {
-                "api": "SYNO.SurveillanceStation.Camera.Event",
-                "method": "list",
-                "version": "9",  # ← ВАЖНО: версия 9 из диагностики
+                "api": "SYNO.SurveillanceStation.Camera",
                 "_sid": self.sid,
-                "fromTime": start_time,
-                "toTime": end_time,
+                "version": "9",
+                "method": "List",
             }
 
-            # Добавляем cameraIds только если указан
-            if camera_id:
-                params["cameraIds"] = str(camera_id)
+            response = self.session.get(self.base_url, params=params, timeout=10)
+            data = response.json()
 
-            # Пробуем разные комбинации параметров если первая не сработает
-            test_cases = [
-                params,  # 1. Без фильтров
-                {**params, "eventFilter": "motion"},  # 2. С фильтром движения
-                {**params, "blIncludeSnapshot": "false"},  # 3. Без снимков
-                {**params, "limit": "100", "offset": "0"},  # 4. С лимитом
-            ]
+            if data.get("success"):
+                cameras = data.get("data", {}).get("cameras", [])
+                self.cameras_config = {}
 
-            for i, test_params in enumerate(test_cases):
-                try:
-                    logger.debug(f"Пробуем параметры #{i+1}: {test_params}")
-                    response = self.session.get(
-                        event_url, params=test_params, timeout=15
-                    )
-                    response.raise_for_status()
+                for cam in cameras:
+                    self.cameras_config[cam["id"]] = {
+                        "id": cam["id"],
+                        "name": cam.get("newName", cam.get("name", "Unknown")),
+                        "ip": cam.get("ip", "N/A"),
+                        "model": cam.get("model", "N/A"),
+                    }
 
-                    data = response.json()
-                    if data.get("success"):
-                        events = data.get("data", {}).get("events", [])
-                        logger.info(
-                            f"Retrieved {len(events)} events with params #{i+1}"
-                        )
-                        return events
-                    else:
-                        logger.debug(f"Params #{i+1} failed: {data.get('error')}")
+                # Сохраняем в файл
+                config_data = {
+                    "cameras": self.cameras_config,
+                    "sid": self.sid,
+                    "updated": datetime.now().isoformat(),
+                }
 
-                except Exception as e:
-                    logger.debug(f"Params #{i+1} error: {e}")
-                    continue
+                with open(self.config_file, "w") as f:
+                    json.dump(config_data, f, indent=2)
 
-            # Если ни один вариант не сработал
-            logger.warning("All parameter combinations failed for events API")
-            return []
+                logger.info(f"Saved config for {len(cameras)} cameras")
+                return True
 
-        except RequestException as e:
-            logger.error(f"Error fetching events: {e}")
-            if "session" in str(e).lower():
-                self.sid = None
-            raise
+        except Exception as e:
+            logger.error(f"Error saving camera config: {e}")
 
-    @retry(
-        stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=5)
-    )
-    def download_event(self, event_id, output_path):
-        """Скачивает видео события"""
-        if not self.is_session_valid():
-            self.login()
+        return False
 
+    def get_last_recording_id(self, camera_id):
+        """Получает ID последней записи для камеры"""
         try:
-            download_url = f"{self.base_url}/SurveillanceStation/camera.cgi"
             params = {
-                "api": "SYNO.SurveillanceStation.Camera.Event",
-                "method": "download",
-                "version": "1",
+                "api": "SYNO.SurveillanceStation.Recording",
                 "_sid": self.sid,
-                "id": event_id,
-                "downloadType": "file",
+                "version": "6",
+                "method": "List",
+                "cameraIds": str(camera_id),
+                "limit": "1",
+                "offset": "0",
+                "fromTime": "0",
+                "toTime": "0",
+            }
+
+            response = self.session.get(self.base_url, params=params, timeout=10)
+            data = response.json()
+
+            if data.get("success") and data["data"].get("recordings"):
+                recording_id = data["data"]["recordings"][0]["id"]
+                logger.debug(
+                    f"Last recording ID for camera {camera_id}: {recording_id}"
+                )
+                return recording_id
+
+        except Exception as e:
+            logger.error(f"Error getting last recording: {e}")
+
+        return None
+
+    def download_recording(self, recording_id, offset_ms=0, duration_ms=10000):
+        """Скачивает фрагмент записи"""
+        try:
+            download_url = f"{self.base_url}/temp.mp4"
+
+            params = {
+                "api": "SYNO.SurveillanceStation.Recording",
+                "method": "Download",
+                "version": "6",
+                "_sid": self.sid,
+                "id": recording_id,
+                "mountId": "0",
+                "offsetTimeMs": str(offset_ms),
+                "playTimeMs": str(duration_ms),
             }
 
             response = self.session.get(
@@ -180,220 +170,130 @@ class SynologyAPI:
             )
             response.raise_for_status()
 
-            with open(output_path, "wb") as f:
+            # Создаем временный файл
+            temp_file = f"/tmp/rec_{recording_id}_{int(time.time())}.mp4"
+
+            with open(temp_file, "wb") as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     f.write(chunk)
 
-            logger.info(f"Downloaded event {event_id} to {output_path}")
-            return True
+            logger.info(f"Downloaded recording {recording_id} to {temp_file}")
+            return temp_file
 
-        except RequestException as e:
-            logger.error(f"Error downloading event {event_id}: {e}")
-            raise
+        except Exception as e:
+            logger.error(f"Error downloading recording {recording_id}: {e}")
+            return None
 
 
 class TelegramBot:
-    """Клиент для отправки сообщений в Telegram"""
+    """Класс для работы с Telegram"""
 
     def __init__(self):
         self.token = os.getenv("TG_TOKEN")
         self.chat_id = os.getenv("TG_CHAT_ID")
-        self.base_url = f"https://api.telegram.org/bot{self.token}"
+        self.bot = telebot.TeleBot(self.token)
 
-    @retry(
-        stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=5)
-    )
-    def send_video(self, video_path, caption=""):
+    def send_video(self, video_path, camera_name="Camera"):
         """Отправляет видео в Telegram"""
         try:
-            with open(video_path, "rb") as video_file:
-                files = {"video": video_file}
-                data = {
-                    "chat_id": self.chat_id,
-                    "caption": caption,
-                    "supports_streaming": True,
-                }
+            caption = (
+                f"📹 {camera_name}\n🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            )
 
-                response = requests.post(
-                    f"{self.base_url}/sendVideo", files=files, data=data, timeout=60
-                )
-                response.raise_for_status()
+            with open(video_path, "rb") as video_file:
+                self.bot.send_video(self.chat_id, video_file, caption=caption)
 
             logger.info(f"Video sent to Telegram: {video_path}")
             return True
 
-        except RequestException as e:
-            logger.error(f"Error sending video to Telegram: {e}")
-            raise
-
-
-class StateManager:
-    """Управление состоянием обработанных событий"""
-
-    def __init__(self, state_file):
-        self.state_file = Path(state_file)
-        self.processed_events = set()
-        self.last_check_time = None
-        self.load_state()
-
-    def load_state(self):
-        """Загружает состояние из файла"""
-        try:
-            if self.state_file.exists():
-                with open(self.state_file, "r") as f:
-                    state = json.load(f)
-                    self.processed_events = set(state.get("processed_events", []))
-                    self.last_check_time = state.get("last_check_time")
-                    logger.info(
-                        f"Loaded state with {len(self.processed_events)} processed events"
-                    )
         except Exception as e:
-            logger.warning(f"Could not load state: {e}")
-            # При первой загрузке проверяем последние N минут
-            self.last_check_time = int(
-                time.time() - int(os.getenv("LOOKBACK_MINUTES", 5)) * 60
-            )
-
-    def save_state(self):
-        """Сохраняет состояние в файл"""
-        try:
-            state = {
-                "processed_events": list(self.processed_events),
-                "last_check_time": self.last_check_time,
-                "updated_at": datetime.now().isoformat(),
-            }
-
-            with open(self.state_file, "w") as f:
-                json.dump(state, f, indent=2)
-
-            logger.debug("State saved successfully")
-        except Exception as e:
-            logger.error(f"Error saving state: {e}")
-
-    def is_event_processed(self, event_id):
-        """Проверяет, было ли событие уже обработано"""
-        return event_id in self.processed_events
-
-    def mark_event_processed(self, event_id):
-        """Помечает событие как обработанное"""
-        self.processed_events.add(event_id)
-
-    def cleanup_old_events(self, max_age_days=7):
-        """Очищает старые события из состояния"""
-        # В этой реализации просто ограничиваем размер множества
-        if len(self.processed_events) > 1000:
-            # Оставляем только последние 1000 событий
-            self.processed_events = set(list(self.processed_events)[-1000:])
+            logger.error(f"Error sending video: {e}")
+            return False
 
 
 def main():
-    """Основная функция приложения"""
-    logger.info("Starting Surveillance Station to Telegram Bot")
+    """Основная функция - адаптированный вариант"""
+    logger.info("Starting adapted Surveillance Station to Telegram Bot")
 
-    # Инициализация компонентов
-    synology = SynologyAPI()
+    # Проверка обязательных переменных
+    required_vars = ["SYNO_IP", "SYNO_USER", "SYNO_PASS", "TG_TOKEN", "TG_CHAT_ID"]
+    for var in required_vars:
+        if not os.getenv(var):
+            logger.error(f"Missing required environment variable: {var}")
+            return
+
+    camera_id = os.getenv("CAMERA_ID", "5")
+    check_interval = int(os.getenv("CHECK_INTERVAL", "30"))
+
+    # Инициализация
+    synology = SynologySurveillance()
     telegram = TelegramBot()
-    state = StateManager(os.getenv("STATE_FILE", "/data/state.json"))
 
-    # Graceful shutdown флаг
+    # Аутентификация
+    if not synology.login():
+        logger.error("Failed to authenticate to Surveillance Station")
+        return
+
+    # Загружаем конфигурацию камер
+    camera_name = synology.cameras_config.get(camera_id, {}).get(
+        "name", f"Camera {camera_id}"
+    )
+    logger.info(f"Monitoring camera: {camera_name} (ID: {camera_id})")
+
+    # Отслеживаем последние записи
+    last_recording_id = None
     shutdown_requested = False
 
     def signal_handler(signum, frame):
         nonlocal shutdown_requested
-        logger.info(f"Received signal {signum}, initiating shutdown")
+        logger.info(f"Received signal {signum}, shutting down")
         shutdown_requested = True
 
-    # Регистрация обработчиков сигналов
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
 
-    check_interval = int(os.getenv("CHECK_INTERVAL", 30))
-    camera_id = os.getenv("CAMERA_ID")
+    logger.info("Starting monitoring loop...")
 
-    # Основной цикл
     while not shutdown_requested:
         try:
-            # Определяем временной диапазон для проверки
-            end_time = int(time.time())
-            start_time = state.last_check_time or (
-                end_time - int(os.getenv("LOOKBACK_MINUTES", 5)) * 60
-            )
+            # Получаем ID последней записи
+            current_recording_id = synology.get_last_recording_id(camera_id)
 
-            logger.debug(
-                f"Checking events from {datetime.fromtimestamp(start_time)} to {datetime.fromtimestamp(end_time)}"
-            )
+            if current_recording_id and current_recording_id != last_recording_id:
+                logger.info(f"New recording detected: {current_recording_id}")
 
-            # Получаем события движения
-            events = synology.get_events(start_time, end_time, camera_id)
+                # Скачиваем первые 10 секунд
+                video_file = synology.download_recording(current_recording_id, 0, 10000)
 
-            # Обрабатываем каждое событие
-            for event in events:
-                event_id = event.get("id")
-
-                # Пропускаем уже обработанные события
-                if state.is_event_processed(event_id):
-                    logger.debug(f"Event {event_id} already processed, skipping")
-                    continue
-
-                # Создаем временный файл для видео
-                temp_file = f"/tmp/event_{event_id}_{int(time.time())}.mp4"
-
-                try:
-                    # Скачиваем видео события
-                    if synology.download_event(event_id, temp_file):
-                        # Формируем подпись
-                        event_time = datetime.fromtimestamp(
-                            event.get("startTime", time.time())
+                if video_file:
+                    # Отправляем в Telegram
+                    if telegram.send_video(video_file, camera_name):
+                        last_recording_id = current_recording_id
+                        logger.info(
+                            f"Successfully sent recording {current_recording_id}"
                         )
-                        caption = f"🚨 Движение обнаружено\n📷 Камера: {event.get('cameraName', 'Unknown')}\n🕐 Время: {event_time.strftime('%Y-%m-%d %H:%M:%S')}"
 
-                        # Отправляем в Telegram
-                        if telegram.send_video(temp_file, caption):
-                            # Помечаем как обработанное
-                            state.mark_event_processed(event_id)
-                            logger.info(f"Successfully processed event {event_id}")
-
-                except Exception as e:
-                    logger.error(f"Error processing event {event_id}: {e}")
-
-                finally:
                     # Удаляем временный файл
                     try:
-                        if os.path.exists(temp_file):
-                            os.remove(temp_file)
-                    except Exception as e:
-                        logger.warning(f"Could not delete temp file {temp_file}: {e}")
+                        os.remove(video_file)
+                    except:
+                        pass
+                else:
+                    logger.error(f"Failed to download recording {current_recording_id}")
 
-                # Проверяем флаг shutdown после каждого события
-                if shutdown_requested:
-                    logger.info("Shutdown requested, breaking event loop")
-                    break
-
-            # Обновляем время последней проверки
-            state.last_check_time = end_time
-            state.save_state()
-
-            # Очистка старых событий раз в час
-            if int(time.time()) % 3600 < check_interval:
-                state.cleanup_old_events()
-
-            # Ждем следующей проверки
+            # Ждем перед следующей проверкой
             for _ in range(check_interval):
                 if shutdown_requested:
                     break
                 time.sleep(1)
 
         except KeyboardInterrupt:
-            logger.info("Keyboard interrupt received")
-            shutdown_requested = True
             break
         except Exception as e:
-            logger.error(f"Unexpected error in main loop: {e}")
-            time.sleep(10)  # Пауза при ошибке
+            logger.error(f"Error in main loop: {e}")
+            time.sleep(10)
 
-    # Завершение работы
-    logger.info("Application shutdown complete")
-    state.save_state()
+    logger.info("Bot stopped")
 
 
 if __name__ == "__main__":
