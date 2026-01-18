@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Surveillance Station to Telegram Bot
-Улучшенная версия с отправкой полных видеозаписей событий
+Исправленная версия с загрузкой полных видеозаписей
 """
 
 import os
@@ -9,6 +9,7 @@ import json
 import time
 import signal
 import logging
+import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
@@ -260,32 +261,19 @@ class SynologyAPI:
     @retry(
         stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10)
     )
-    def download_recording_part(
-        self, recording: Recording, offset_ms: int = 0, duration_ms: int = None
-    ) -> Optional[str]:
-        """Скачивает часть записи с указанным смещением и длительностью"""
+    def download_complete_recording(self, recording: Recording) -> Optional[str]:
+        """Скачивает запись целиком без обрезки"""
         if not self.ensure_session():
             return None
 
         temp_file = None
         try:
             temp_file = tempfile.NamedTemporaryFile(
-                suffix=(
-                    f"_part_{offset_ms}_{duration_ms}.mp4" if duration_ms else ".mp4"
-                ),
-                delete=False,
-                dir="/tmp",
+                suffix=f"_{recording.id}.mp4", delete=False, dir="/tmp"
             )
             temp_file.close()
 
-            # Используем полную длительность записи, если не указана
-            if duration_ms is None:
-                duration_ms = recording.duration - offset_ms
-
-            # Ограничиваем максимальную длительность для одного скачивания (2 минуты)
-            max_chunk_duration = int(os.getenv("MAX_CHUNK_DURATION_MS", "120000"))
-            download_duration_ms = min(duration_ms, max_chunk_duration)
-
+            # Ключевое изменение: НЕ передаем offsetTimeMs и playTimeMs
             params = {
                 "api": "SYNO.SurveillanceStation.Recording",
                 "method": "Download",
@@ -293,18 +281,13 @@ class SynologyAPI:
                 "_sid": self.sid,
                 "id": recording.id,
                 "mountId": "0",
-                "offsetTimeMs": str(offset_ms),
-                "playTimeMs": str(download_duration_ms),
+                # Не передаем offsetTimeMs и playTimeMs - это загрузит полное видео
             }
 
-            logger.info(
-                f"📥 Скачиваю часть записи {recording.id}: "
-                f"смещение={offset_ms/1000:.1f}с, "
-                f"длительность={download_duration_ms/1000:.1f}с"
-            )
+            logger.info(f"📥 Скачиваю полную запись {recording.id}")
 
             response = self.session.get(
-                self.base_url, params=params, stream=True, timeout=120
+                self.base_url, params=params, stream=True, timeout=180
             )
             response.raise_for_status()
 
@@ -319,20 +302,24 @@ class SynologyAPI:
 
             file_size = os.path.getsize(temp_file.name)
 
-            if file_size > 0:
+            # Пытаемся получить реальную длительность из метаданных файла
+            actual_duration = self.get_video_duration(temp_file.name)
+            if actual_duration:
+                recording.duration = int(actual_duration * 1000)
                 logger.info(
-                    f"✅ Часть записи скачана: "
-                    f"{file_size/(1024*1024):.1f} МБ, "
-                    f"смещение={offset_ms/1000:.1f}с"
+                    f"📏 Фактическая длительность видео: {actual_duration:.1f} сек"
                 )
-                return temp_file.name
-            else:
-                logger.warning(f"⚠️ Скачанный файл пуст: {temp_file.name}")
-                os.remove(temp_file.name)
-                return None
+
+            recording.size = file_size
+
+            logger.info(
+                f"✅ Запись {recording.id} скачана: {file_size/(1024*1024):.1f} МБ"
+            )
+
+            return temp_file.name
 
         except RequestException as e:
-            logger.error(f"❌ Ошибка скачивания части записи {recording.id}: {e}")
+            logger.error(f"❌ Ошибка скачивания записи {recording.id}: {e}")
             if temp_file and os.path.exists(temp_file.name):
                 try:
                     os.remove(temp_file.name)
@@ -348,66 +335,145 @@ class SynologyAPI:
                     pass
             return None
 
-    def download_full_recording(self, recording: Recording) -> List[str]:
-        """Скачивает запись целиком по частям и возвращает список путей к файлам"""
-        logger.info(f"📥 Начинаю скачивание полной записи {recording.id}")
+    def get_video_duration(self, file_path: str) -> Optional[float]:
+        """Получает длительность видео файла с помощью ffprobe"""
+        try:
+            if not os.path.exists(file_path):
+                return None
 
-        chunk_files = []
-        max_chunk_size = 45 * 1024 * 1024  # 45 МБ для запаса
-        max_chunk_duration = int(
-            os.getenv("MAX_CHUNK_DURATION_MS", "120000")
-        )  # 2 минуты
-
-        offset_ms = 0
-        remaining_duration = recording.duration
-
-        while remaining_duration > 0:
-            # Рассчитываем длительность для следующего чанка
-            chunk_duration = min(remaining_duration, max_chunk_duration)
-
-            # Скачиваем часть
-            chunk_file = self.download_recording_part(
-                recording, offset_ms=offset_ms, duration_ms=chunk_duration
+            result = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    file_path,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
 
-            if chunk_file:
-                # Проверяем размер файла
-                file_size = os.path.getsize(chunk_file)
+            if result.returncode == 0 and result.stdout:
+                return float(result.stdout.strip())
+        except Exception as e:
+            logger.debug(f"Не удалось определить длительность видео: {e}")
 
-                if file_size > max_chunk_size:
-                    logger.warning(
-                        f"⚠️ Чанк слишком большой ({file_size/(1024*1024):.1f} МБ), удаляю"
+        return None
+
+    def handle_large_recording(self, recording: Recording) -> List[str]:
+        """Обрабатывает большие записи, разбивая их на части для Telegram"""
+        logger.info(
+            f"📦 Обработка записи {recording.id} ({recording.duration/1000:.1f} сек)"
+        )
+
+        # Пытаемся скачать полную запись
+        full_file = self.download_complete_recording(recording)
+
+        if not full_file:
+            return []
+
+        file_size = os.path.getsize(full_file)
+
+        # Если файл меньше лимита Telegram, возвращаем как есть
+        if file_size <= 45 * 1024 * 1024:  # 45 МБ с запасом
+            return [full_file]
+
+        # Если файл слишком большой, разбиваем его
+        logger.info(
+            f"✂️ Файл слишком большой ({file_size/(1024*1024):.1f} МБ), разбиваю на части..."
+        )
+
+        try:
+            # Получаем длительность видео
+            total_duration = self.get_video_duration(full_file)
+            if not total_duration or total_duration <= 0:
+                logger.error("Не удалось получить длительность видео")
+                return [full_file]
+
+            # Вычисляем, на сколько частей нужно разбить
+            # Предполагаем, что 1 минута видео ≈ 10 МБ
+            estimated_size_per_minute = 10 * 1024 * 1024
+            target_chunk_duration = (
+                (45 * 1024 * 1024) / estimated_size_per_minute * 60
+            )  # секунды
+
+            if target_chunk_duration < 30:  # Минимум 30 секунд
+                target_chunk_duration = 30
+
+            num_chunks = int(total_duration / target_chunk_duration) + 1
+            chunk_duration = total_duration / num_chunks
+
+            logger.info(
+                f"📊 Разбиваю на {num_chunks} частей по {chunk_duration:.1f} сек"
+            )
+
+            chunk_files = []
+
+            # Разбиваем файл на части
+            for i in range(num_chunks):
+                start_time = i * chunk_duration
+                chunk_file = tempfile.NamedTemporaryFile(
+                    suffix=f"_{recording.id}_part_{i+1}_of_{num_chunks}.mp4",
+                    delete=False,
+                    dir="/tmp",
+                )
+                chunk_file.close()
+
+                # Используем ffmpeg для вырезания части
+                try:
+                    subprocess.run(
+                        [
+                            "ffmpeg",
+                            "-i",
+                            full_file,
+                            "-ss",
+                            str(start_time),
+                            "-t",
+                            str(chunk_duration),
+                            "-c",
+                            "copy",  # Копируем кодек без перекодирования (быстро)
+                            "-avoid_negative_ts",
+                            "1",
+                            chunk_file.name,
+                        ],
+                        capture_output=True,
+                        timeout=30,
+                        check=True,
                     )
-                    os.remove(chunk_file)
 
-                    # Пробуем скачать меньший кусок
-                    if chunk_duration > 30000:  # Если больше 30 секунд
-                        new_chunk_duration = chunk_duration // 2
-                        chunk_file = self.download_recording_part(
-                            recording,
-                            offset_ms=offset_ms,
-                            duration_ms=new_chunk_duration,
+                    chunk_size = os.path.getsize(chunk_file.name)
+                    if chunk_size > 0:
+                        chunk_files.append(chunk_file.name)
+                        logger.info(
+                            f"✅ Создана часть {i+1}/{num_chunks} ({chunk_size/(1024*1024):.1f} МБ)"
                         )
+                    else:
+                        logger.warning(f"⚠️ Созданная часть {i+1} пуста")
+                        os.remove(chunk_file.name)
 
-                        if chunk_file:
-                            chunk_files.append(chunk_file)
-                            offset_ms += new_chunk_duration
-                            remaining_duration -= new_chunk_duration
-                        else:
-                            break
-                else:
-                    chunk_files.append(chunk_file)
-                    offset_ms += chunk_duration
-                    remaining_duration -= chunk_duration
+                except subprocess.CalledProcessError as e:
+                    logger.error(f"❌ Ошибка при создании части {i+1}: {e}")
+                    if os.path.exists(chunk_file.name):
+                        os.remove(chunk_file.name)
+
+            # Удаляем исходный большой файл
+            os.remove(full_file)
+
+            if chunk_files:
+                return chunk_files
             else:
-                logger.error(f"❌ Не удалось скачать часть записи")
-                break
+                logger.error("Не удалось создать ни одной части")
+                return []
 
-            # Небольшая пауза между скачиваниями
-            time.sleep(1)
-
-        logger.info(f"✅ Скачано {len(chunk_files)} частей записи {recording.id}")
-        return chunk_files
+        except Exception as e:
+            logger.error(f"❌ Ошибка при разбивке файла: {e}")
+            return [full_file]  # Возвращаем как есть
 
     def get_camera_name(self, camera_id: str) -> str:
         """Получает имя камеры по ID"""
@@ -510,7 +576,10 @@ class TelegramBot:
                 }
 
                 if part_info:
-                    data["caption"] = f"{caption}\n\n{part_info}"
+                    if caption:
+                        data["caption"] = f"{caption}\n\n{part_info}"
+                    else:
+                        data["caption"] = part_info
 
                 response = requests.post(
                     f"{self.base_url}/sendVideo", files=files, data=data, timeout=120
@@ -575,6 +644,12 @@ class TelegramBot:
 
             except Exception as e:
                 logger.error(f"❌ Ошибка при отправке части {i+1}: {e}")
+                # Пробуем удалить файл даже в случае ошибки
+                try:
+                    if os.path.exists(chunk_file):
+                        os.remove(chunk_file)
+                except:
+                    pass
 
         logger.info(f"📊 Отправлено {success_count} из {total_parts} частей")
         return success_count > 0
@@ -855,9 +930,14 @@ def main():
                     )
 
                     try:
-                        # Скачиваем запись целиком по частям
-                        logger.info(f"📥 Скачиваю полную запись {recording.id}...")
-                        chunk_files = synology.download_full_recording(recording)
+                        # Определяем стратегию загрузки
+                        if recording.duration > 120000:  # Если больше 2 минут
+                            # Используем обработчик больших записей
+                            chunk_files = synology.handle_large_recording(recording)
+                        else:
+                            # Для коротких записей просто скачиваем целиком
+                            full_file = synology.download_complete_recording(recording)
+                            chunk_files = [full_file] if full_file else []
 
                         if chunk_files:
                             # Рассчитываем общий размер
@@ -866,7 +946,7 @@ def main():
                             # Формируем подпись
                             caption = format_caption(recording, camera_name, total_size)
 
-                            # Отправляем видео частями
+                            # Отправляем видео
                             logger.info(
                                 f"📨 Отправляю запись {recording.id} ({len(chunk_files)} частей)..."
                             )
