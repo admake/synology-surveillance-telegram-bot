@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Surveillance Station to Telegram Bot
-Версия с отправкой видеозаписей по частям в реальном времени
+Версия с корректной отправкой фрагментов видео в реальном времени
 """
 
 import os
@@ -13,7 +13,7 @@ import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple, Set
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 import tempfile
 
 import requests
@@ -44,18 +44,20 @@ class Recording:
     start_time: int  # Unix timestamp в секундах
     duration: int  # Длительность в миллисекундах
     size: int  # Размер в байтах
-    file_path: Optional[str] = None
+    filename: str = ""
 
 
 @dataclass
 class RecordingProgress:
-    """Отслеживание прогресса отправки записи"""
+    """Отслеживание прогресса обработки записи"""
 
     recording_id: str
-    last_offset: int = 0  # Последнее отправленное смещение в миллисекундах
+    last_offset_ms: int = 0  # Последнее обработанное смещение в миллисекундах
     last_processed_time: int = 0  # Время последней обработки
     fragments_sent: int = 0  # Количество отправленных фрагментов
-    is_complete: bool = False  # Запись полностью отправлена
+    is_completed: bool = False  # Запись полностью обработана
+    max_duration_ms: int = 0  # Максимальная обнаруженная длительность записи
+    last_checked_time: int = 0  # Время последней проверки записи
 
 
 class SynologyAPI:
@@ -182,7 +184,7 @@ class SynologyAPI:
             current_time = int(time.time())
 
             if from_time is None:
-                from_time = current_time - 300  # 5 минут назад
+                from_time = current_time - 600  # 10 минут назад
             if to_time is None:
                 to_time = current_time
 
@@ -213,9 +215,9 @@ class SynologyAPI:
                 for rec in recordings_data:
                     try:
                         start_time = rec.get("startTime", 0)
+                        filename = rec.get("filename", "")
 
                         if start_time <= 0 or start_time > current_time:
-                            filename = rec.get("filename", "")
                             if filename:
                                 try:
                                     import re
@@ -247,6 +249,7 @@ class SynologyAPI:
                             start_time=start_time,
                             duration=duration,
                             size=size,
+                            filename=filename,
                         )
                         recordings.append(recording)
 
@@ -280,7 +283,7 @@ class SynologyAPI:
         stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10)
     )
     def download_recording_fragment(
-        self, recording: Recording, offset_ms: int, duration_ms: int = 10000
+        self, recording_id: str, offset_ms: int, duration_ms: int = 10000
     ) -> Optional[str]:
         """Скачивает фрагмент записи с указанным смещением и длительностью"""
         if not self.ensure_session():
@@ -289,7 +292,7 @@ class SynologyAPI:
         temp_file = None
         try:
             temp_file = tempfile.NamedTemporaryFile(
-                suffix=f"_{recording.id}_frag_{offset_ms}_{duration_ms}.mp4",
+                suffix=f"_{recording_id}_frag_{offset_ms}_{duration_ms}.mp4",
                 delete=False,
                 dir="/tmp",
             )
@@ -300,24 +303,31 @@ class SynologyAPI:
                 "method": "Download",
                 "version": self.api_version,
                 "_sid": self.sid,
-                "id": recording.id,
+                "id": recording_id,
                 "mountId": "0",
                 "offsetTimeMs": str(offset_ms),
                 "playTimeMs": str(duration_ms),
             }
 
             logger.debug(
-                f"📥 Скачиваю фрагмент записи {recording.id}: "
+                f"📥 Скачиваю фрагмент записи {recording_id}: "
                 f"смещение={offset_ms/1000:.1f}с, "
                 f"длительность={duration_ms/1000:.1f}с"
             )
 
             response = self.session.get(
-                self.base_url, params=params, stream=True, timeout=60
+                self.base_url, params=params, stream=True, timeout=30
             )
+
+            # Проверяем статус ответа
+            if response.status_code != 200:
+                logger.warning(
+                    f"⚠️ API вернул статус {response.status_code} для записи {recording_id}"
+                )
+                return None
+
             response.raise_for_status()
 
-            total_size = int(response.headers.get("content-length", 0))
             downloaded = 0
 
             with open(temp_file.name, "wb") as f:
@@ -341,7 +351,7 @@ class SynologyAPI:
                 return None
 
         except RequestException as e:
-            logger.error(f"❌ Ошибка скачивания фрагмента записи {recording.id}: {e}")
+            logger.warning(f"⚠️ Ошибка скачивания фрагмента записи {recording_id}: {e}")
             if temp_file and os.path.exists(temp_file.name):
                 try:
                     os.remove(temp_file.name)
@@ -430,9 +440,7 @@ class TelegramBot:
     @retry(
         stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10)
     )
-    def send_video(
-        self, video_path: str, caption: str = "", part_info: str = ""
-    ) -> bool:
+    def send_video(self, video_path: str, caption: str = "") -> bool:
         """Отправляет видео в Telegram"""
         try:
             file_size = os.path.getsize(video_path)
@@ -445,7 +453,7 @@ class TelegramBot:
                 return False
 
             logger.info(
-                f"📤 Отправляю видео в Telegram ({file_size/(1024*1024):.1f} МБ) {part_info}"
+                f"📤 Отправляю видео в Telegram ({file_size/(1024*1024):.1f} МБ)"
             )
 
             with open(video_path, "rb") as video_file:
@@ -456,12 +464,6 @@ class TelegramBot:
                     "supports_streaming": True,
                     "parse_mode": "HTML",
                 }
-
-                if part_info:
-                    if caption:
-                        data["caption"] = f"{caption}\n\n{part_info}"
-                    else:
-                        data["caption"] = part_info
 
                 response = requests.post(
                     f"{self.base_url}/sendVideo", files=files, data=data, timeout=120
@@ -476,7 +478,7 @@ class TelegramBot:
                 result = response.json()
 
                 if result.get("ok"):
-                    logger.info(f"✅ Видео успешно отправлено в Telegram {part_info}")
+                    logger.info(f"✅ Видео успешно отправлено в Telegram")
                     return True
                 else:
                     logger.error(f"❌ Ошибка Telegram API: {result}")
@@ -487,15 +489,13 @@ class TelegramBot:
             return False
 
 
-class RecordingTracker:
-    """Отслеживает прогресс отправки записей"""
+class RecordingManager:
+    """Управление состоянием обработки записей"""
 
     def __init__(self, state_file: str):
         self.state_file = Path(state_file)
-        self.active_recordings: Dict[str, RecordingProgress] = (
-            {}
-        )  # ID записи -> прогресс
-        self.completed_recordings: Set[str] = set()  # ID полностью отправленных записей
+        self.active_recordings: Dict[str, RecordingProgress] = {}
+        self.completed_recordings: Set[str] = set()
 
         self.load_state()
 
@@ -514,10 +514,12 @@ class RecordingTracker:
                     for rec_id, rec_data in active_data.items():
                         progress = RecordingProgress(
                             recording_id=rec_id,
-                            last_offset=rec_data.get("last_offset", 0),
+                            last_offset_ms=rec_data.get("last_offset_ms", 0),
                             last_processed_time=rec_data.get("last_processed_time", 0),
                             fragments_sent=rec_data.get("fragments_sent", 0),
-                            is_complete=rec_data.get("is_complete", False),
+                            is_completed=rec_data.get("is_completed", False),
+                            max_duration_ms=rec_data.get("max_duration_ms", 0),
+                            last_checked_time=rec_data.get("last_checked_time", 0),
                         )
                         self.active_recordings[rec_id] = progress
 
@@ -535,10 +537,12 @@ class RecordingTracker:
                 "completed_recordings": list(self.completed_recordings),
                 "active_recordings": {
                     rec_id: {
-                        "last_offset": progress.last_offset,
+                        "last_offset_ms": progress.last_offset_ms,
                         "last_processed_time": progress.last_processed_time,
                         "fragments_sent": progress.fragments_sent,
-                        "is_complete": progress.is_complete,
+                        "is_completed": progress.is_completed,
+                        "max_duration_ms": progress.max_duration_ms,
+                        "last_checked_time": progress.last_checked_time,
                     }
                     for rec_id, progress in self.active_recordings.items()
                 },
@@ -550,66 +554,84 @@ class RecordingTracker:
             with open(self.state_file, "w") as f:
                 json.dump(state, f, indent=2, ensure_ascii=False)
 
-            logger.debug(
-                f"💾 Состояние сохранено: {len(self.active_recordings)} активных записей"
-            )
+            logger.debug(f"💾 Состояние сохранено")
         except Exception as e:
             logger.error(f"❌ Ошибка сохранения состояния: {e}")
 
     def is_completed(self, recording_id: str) -> bool:
-        """Проверяет, была ли запись полностью отправлена"""
+        """Проверяет, была ли запись полностью обработана"""
         return recording_id in self.completed_recordings
 
     def get_progress(self, recording_id: str) -> Optional[RecordingProgress]:
         """Получает прогресс обработки записи"""
         return self.active_recordings.get(recording_id)
 
-    def start_tracking(self, recording_id: str) -> RecordingProgress:
+    def start_recording(self, recording: Recording) -> RecordingProgress:
         """Начинает отслеживание новой записи"""
+        current_time = int(time.time())
         progress = RecordingProgress(
-            recording_id=recording_id,
-            last_offset=0,
-            last_processed_time=int(time.time()),
+            recording_id=recording.id,
+            last_offset_ms=0,
+            last_processed_time=current_time,
             fragments_sent=0,
-            is_complete=False,
+            is_completed=False,
+            max_duration_ms=recording.duration,
+            last_checked_time=current_time,
         )
-        self.active_recordings[recording_id] = progress
+
+        self.active_recordings[recording.id] = progress
         self.save_state()
+
+        logger.info(f"🆕 Начинаю отслеживание записи {recording.id}")
         return progress
 
-    def update_progress(self, recording_id: str, new_offset: int) -> None:
-        """Обновляет прогресс отправки записи"""
+    def update_recording_duration(
+        self, recording_id: str, new_duration_ms: int
+    ) -> None:
+        """Обновляет информацию о длительности записи"""
         if recording_id in self.active_recordings:
             progress = self.active_recordings[recording_id]
-            progress.last_offset = new_offset
-            progress.last_processed_time = int(time.time())
+            if new_duration_ms > progress.max_duration_ms:
+                progress.max_duration_ms = new_duration_ms
+                progress.last_checked_time = int(time.time())
+                self.save_state()
+                logger.debug(
+                    f"📊 Обновлена длительность записи {recording_id}: {new_duration_ms}мс"
+                )
+
+    def mark_fragment_sent(self, recording_id: str, offset_ms: int) -> None:
+        """Отмечает отправку фрагмента записи"""
+        if recording_id in self.active_recordings:
+            progress = self.active_recordings[recording_id]
+            progress.last_offset_ms = offset_ms
             progress.fragments_sent += 1
+            progress.last_processed_time = int(time.time())
             self.save_state()
 
     def mark_completed(self, recording_id: str) -> None:
-        """Помечает запись как полностью отправленную"""
+        """Помечает запись как полностью обработанную"""
         if recording_id in self.active_recordings:
             del self.active_recordings[recording_id]
+
         self.completed_recordings.add(recording_id)
         self.save_state()
+        logger.info(f"✅ Запись {recording_id} помечена как завершённая")
 
     def cleanup_old_records(self, max_age_hours: int = 24) -> None:
         """Очищает старые записи из состояния"""
         current_time = time.time()
         max_age_seconds = max_age_hours * 3600
 
-        # Удаляем старые активные записи
+        # Очищаем старые активные записи (которые не обновлялись более 2 часов)
         old_active = [
             rec_id
             for rec_id, progress in self.active_recordings.items()
-            if current_time - progress.last_processed_time > max_age_seconds
+            if current_time - progress.last_processed_time > 7200  # 2 часа
         ]
 
         for rec_id in old_active:
+            logger.info(f"🧹 Удаляю старую активную запись {rec_id}")
             del self.active_recordings[rec_id]
-
-        if old_active:
-            logger.info(f"🧹 Очищено {len(old_active)} старых активных записей")
 
         # Очищаем историю завершённых записей, если их слишком много
         if len(self.completed_recordings) > 1000:
@@ -617,6 +639,20 @@ class RecordingTracker:
             logger.info("🧹 Очищены старые завершённые записи")
 
         self.save_state()
+
+    def get_active_recordings(self) -> List[str]:
+        """Возвращает список ID активных записей"""
+        return list(self.active_recordings.keys())
+
+    def get_stats(self) -> Dict:
+        """Возвращает статистику обработки"""
+        return {
+            "active_recordings": len(self.active_recordings),
+            "completed_recordings": len(self.completed_recordings),
+            "total_fragments_sent": sum(
+                p.fragments_sent for p in self.active_recordings.values()
+            ),
+        }
 
 
 def format_duration(milliseconds: int) -> str:
@@ -639,54 +675,68 @@ def format_duration(milliseconds: int) -> str:
         return f"{hours} ч"
 
 
-def format_fragment_caption(
+def format_caption(
     recording: Recording,
     camera_name: str,
     fragment_num: int,
-    total_fragments: int,
     offset_seconds: float,
     duration_seconds: float,
+    is_fragment: bool = True,
 ) -> str:
-    """Форматирует подпись для фрагмента видео"""
+    """Форматирует подпись для Telegram"""
     try:
         start_time = datetime.fromtimestamp(recording.start_time + offset_seconds)
 
         date_str = start_time.strftime("%d.%m.%Y")
         time_str = start_time.strftime("%H:%M:%S")
 
-        caption = (
-            f"<b>🚨 Обнаружено движение (фрагмент {fragment_num}/{total_fragments})</b>\n\n"
-            f"<b>📅 Дата:</b> {date_str}\n"
-            f"<b>🕐 Время:</b> {time_str}\n"
-            f"<b>📷 Камера:</b> {camera_name}\n"
-            f"<b>⏱️ Позиция:</b> {offset_seconds:.1f}-{offset_seconds + duration_seconds:.1f} сек\n"
-            f"<b>📁 Фрагмент:</b> {fragment_num} из {total_fragments}\n\n"
-            f"<i>#surveillance #motion_detected</i>"
-        )
+        if is_fragment:
+            caption = (
+                f"<b>🚨 Обнаружено движение (фрагмент {fragment_num})</b>\n\n"
+                f"<b>📅 Дата:</b> {date_str}\n"
+                f"<b>🕐 Время:</b> {time_str}\n"
+                f"<b>📷 Камера:</b> {camera_name}\n"
+                f"<b>⏱️ Позиция:</b> {offset_seconds:.1f}-{offset_seconds + duration_seconds:.1f} сек\n\n"
+                f"<i>#surveillance #motion_detected</i>"
+            )
+        else:
+            caption = (
+                f"<b>🚨 Обнаружено движение</b>\n\n"
+                f"<b>📅 Дата:</b> {date_str}\n"
+                f"<b>🕐 Время:</b> {time_str}\n"
+                f"<b>📷 Камера:</b> {camera_name}\n"
+                f"<b>⏱️ Длительность:</b> {format_duration(recording.duration)}\n\n"
+                f"<i>#surveillance #motion_detected</i>"
+            )
 
         return caption
 
     except Exception as e:
         logger.error(f"❌ Ошибка форматирования подписи: {e}")
-        return f"🚨 Обнаружено движение\n📷 Камера: {camera_name}\n📁 Фрагмент: {fragment_num}/{total_fragments}"
+        return f"🚨 Обнаружено движение\n📷 Камера: {camera_name}"
 
 
 def send_startup_message(
     bot: TelegramBot,
     camera_name: str,
     camera_id: str,
-    tracker: RecordingTracker,
+    manager: RecordingManager,
     check_interval: int,
+    fragment_duration: int,
 ) -> None:
     """Отправляет сообщение о запуске контейнера"""
+    stats = manager.get_stats()
+
     message = (
         f"<b>🟢 Бот запущен (режим фрагментов)</b>\n\n"
         f"<b>🤖 Бот:</b> {bot.bot_name}\n"
         f"<b>📷 Камера:</b> {camera_name} (ID: {camera_id})\n"
         f"<b>🔄 Интервал проверки:</b> {check_interval} сек\n"
-        f"<b>📊 Активных записей:</b> {len(tracker.active_recordings)}\n"
-        f"<b>📈 Завершённых записей:</b> {len(tracker.completed_recordings)}\n\n"
-        f"<i>Бот активен и отправляет видео фрагментами по 10 секунд...</i>"
+        f"<b>⏱️ Длительность фрагмента:</b> {fragment_duration/1000} сек\n"
+        f"<b>📊 Активных записей:</b> {stats['active_recordings']}\n"
+        f"<b>📈 Завершённых записей:</b> {stats['completed_recordings']}\n"
+        f"<b>📁 Всего фрагментов:</b> {stats['total_fragments_sent']}\n\n"
+        f"<i>Бот активен и отправляет видео фрагментами...</i>"
     )
 
     if bot.send_message(message):
@@ -697,20 +747,21 @@ def send_startup_message(
 
 def send_shutdown_message(
     bot: TelegramBot,
-    tracker: RecordingTracker,
-    new_recordings: int,
+    manager: RecordingManager,
+    new_fragments: int,
     session_duration: float,
 ) -> None:
     """Отправляет сообщение об остановке контейнера"""
+    stats = manager.get_stats()
     duration_str = format_duration(int(session_duration * 1000))
 
     message = (
         f"<b>🔴 Бот остановлен</b>\n\n"
         f"<b>🤖 Бот:</b> {bot.bot_name}\n"
         f"<b>⏱️ Время работы:</b> {duration_str}\n"
-        f"<b>📊 Обработано в этой сессии:</b> {new_recordings} новых записей\n"
-        f"<b>📈 Активных записей:</b> {len(tracker.active_recordings)}\n"
-        f"<b>📊 Завершённых записей:</b> {len(tracker.completed_recordings)}\n\n"
+        f"<b>📊 Отправлено фрагментов:</b> {new_fragments}\n"
+        f"<b>📈 Активных записей:</b> {stats['active_recordings']}\n"
+        f"<b>📊 Завершённых записей:</b> {stats['completed_recordings']}\n\n"
         f"<i>Бот завершил работу.</i>"
     )
 
@@ -720,135 +771,123 @@ def send_shutdown_message(
         logger.warning("⚠️ Не удалось отправить сообщение об остановке")
 
 
-def process_recording_fragments(
+def process_recording(
     synology: SynologyAPI,
     telegram: TelegramBot,
-    tracker: RecordingTracker,
+    manager: RecordingManager,
     recording: Recording,
     camera_name: str,
     fragment_duration_ms: int = 10000,
-) -> bool:
-    """Обрабатывает запись фрагментами"""
-    progress = tracker.get_progress(recording.id)
+) -> int:
+    """Обрабатывает запись, отправляя фрагменты по мере их появления"""
+    progress = manager.get_progress(recording.id)
+    current_time = time.time()
 
     if not progress:
-        # Начинаем новую запись
-        progress = tracker.start_tracking(recording.id)
-        logger.info(
-            f"🆕 Начинаю обработку записи {recording.id}, длительность: {format_duration(recording.duration)}"
+        # Новая запись
+        progress = manager.start_recording(recording)
+
+        # Сразу отправляем первый фрагмент
+        return send_fragment(
+            synology,
+            telegram,
+            manager,
+            recording,
+            camera_name,
+            progress,
+            fragment_duration_ms,
         )
 
-    current_time = time.time()
-    recording_age = current_time - (recording.start_time + recording.duration / 1000)
+    # Обновляем информацию о длительности записи
+    manager.update_recording_duration(recording.id, recording.duration)
 
-    # Определяем, нужно ли отправлять следующий фрагмент
-    if progress.last_offset >= recording.duration:
-        # Запись полностью отправлена
-        tracker.mark_completed(recording.id)
-        logger.info(
-            f"✅ Запись {recording.id} полностью отправлена ({progress.fragments_sent} фрагментов)"
-        )
-        return True
-
-    # Если запись старая (завершилась более 30 секунд назад) и мы отправили хотя бы один фрагмент
-    if recording_age > 30 and progress.fragments_sent > 0:
-        # Отправляем оставшуюся часть
-        remaining_ms = recording.duration - progress.last_offset
-        if remaining_ms > 0:
-            fragment_ms = min(remaining_ms, fragment_duration_ms)
-
-            # Скачиваем фрагмент
-            fragment_file = synology.download_recording_fragment(
-                recording, progress.last_offset, fragment_ms
-            )
-
-            if fragment_file:
-                # Формируем подпись
-                caption = format_fragment_caption(
-                    recording,
-                    camera_name,
-                    progress.fragments_sent + 1,
-                    progress.fragments_sent
-                    + 1
-                    + max(1, int(remaining_ms / fragment_duration_ms)),
-                    progress.last_offset / 1000,
-                    fragment_ms / 1000,
-                )
-
-                # Отправляем в Telegram
-                if telegram.send_video(fragment_file, caption):
-                    tracker.update_progress(
-                        recording.id, progress.last_offset + fragment_ms
-                    )
-                    logger.info(
-                        f"✅ Отправлен фрагмент {progress.fragments_sent} записи {recording.id}"
-                    )
-                else:
-                    logger.error(
-                        f"❌ Не удалось отправить фрагмент записи {recording.id}"
-                    )
-
-                # Удаляем временный файл
-                try:
-                    os.remove(fragment_file)
-                except Exception as e:
-                    logger.warning(f"⚠️ Не удалось удалить временный файл: {e}")
-
-                return True
-            else:
-                logger.error(f"❌ Не удалось скачать фрагмент записи {recording.id}")
-                return False
-
-    # Для активных записей (которые ещё идут) отправляем следующий фрагмент
-    # только если с момента последней отправки прошло достаточно времени
+    # Проверяем, нужно ли отправлять следующий фрагмент
+    # Для активных записей проверяем, прошло ли достаточно времени с последней отправки
     time_since_last = current_time - progress.last_processed_time
+    fragment_interval = fragment_duration_ms / 1000
 
-    if time_since_last >= (fragment_duration_ms / 1000) - 2:  # -2 секунды для запаса
-        # Определяем длительность фрагмента
-        fragment_ms = fragment_duration_ms
-
-        # Скачиваем фрагмент
-        fragment_file = synology.download_recording_fragment(
-            recording, progress.last_offset, fragment_ms
+    if time_since_last >= fragment_interval - 1:  # -1 секунда для запаса
+        return send_fragment(
+            synology,
+            telegram,
+            manager,
+            recording,
+            camera_name,
+            progress,
+            fragment_duration_ms,
         )
 
-        if fragment_file:
+    return 0
+
+
+def send_fragment(
+    synology: SynologyAPI,
+    telegram: TelegramBot,
+    manager: RecordingManager,
+    recording: Recording,
+    camera_name: str,
+    progress: RecordingProgress,
+    fragment_duration_ms: int,
+) -> int:
+    """Отправляет следующий фрагмент записи"""
+    # Определяем параметры для скачивания фрагмента
+    offset_ms = progress.last_offset_ms
+    duration_ms = fragment_duration_ms
+
+    # Для завершённых записей отправляем оставшуюся часть
+    if progress.max_duration_ms > 0 and offset_ms >= progress.max_duration_ms:
+        logger.info(f"✅ Запись {recording.id} полностью отправлена")
+        manager.mark_completed(recording.id)
+        return 0
+
+    # Скачиваем фрагмент
+    fragment_file = synology.download_recording_fragment(
+        recording.id, offset_ms, duration_ms
+    )
+
+    if fragment_file:
+        try:
             # Формируем подпись
-            total_estimated_fragments = max(
-                1, int(recording.duration / fragment_duration_ms)
-            )
-            caption = format_fragment_caption(
+            caption = format_caption(
                 recording,
                 camera_name,
                 progress.fragments_sent + 1,
-                total_estimated_fragments,
-                progress.last_offset / 1000,
-                fragment_ms / 1000,
+                offset_ms / 1000,
+                duration_ms / 1000,
+                is_fragment=True,
             )
 
             # Отправляем в Telegram
             if telegram.send_video(fragment_file, caption):
-                tracker.update_progress(
-                    recording.id, progress.last_offset + fragment_ms
-                )
+                manager.mark_fragment_sent(recording.id, offset_ms + duration_ms)
                 logger.info(
-                    f"✅ Отправлен фрагмент {progress.fragments_sent} записи {recording.id}"
+                    f"✅ Отправлен фрагмент {progress.fragments_sent + 1} записи {recording.id}"
                 )
+                return 1
             else:
                 logger.error(f"❌ Не удалось отправить фрагмент записи {recording.id}")
-
+                return 0
+        finally:
             # Удаляем временный файл
             try:
                 os.remove(fragment_file)
             except Exception as e:
                 logger.warning(f"⚠️ Не удалось удалить временный файл: {e}")
+    else:
+        # Не удалось скачать фрагмент - возможно, запись завершена
+        logger.debug(
+            f"⚠️ Не удалось скачать фрагмент записи {recording.id}, возможно запись завершена"
+        )
 
-            return True
-        else:
-            logger.error(f"❌ Не удалось скачать фрагмент записи {recording.id}")
-            return False
+        # Проверяем, является ли запись стабильно завершённой
+        current_time = time.time()
+        if current_time - recording.start_time > 300:  # Запись старше 5 минут
+            logger.info(
+                f"📄 Запись {recording.id} завершена, всего фрагментов: {progress.fragments_sent}"
+            )
+            manager.mark_completed(recording.id)
 
-    return False
+        return 0
 
 
 def main():
@@ -867,7 +906,7 @@ def main():
 
     synology = SynologyAPI()
     telegram = TelegramBot()
-    tracker = RecordingTracker(os.getenv("STATE_FILE", "/data/state.json"))
+    manager = RecordingManager(os.getenv("STATE_FILE", "/data/state.json"))
 
     cameras = synology.get_cameras()
     camera_id = os.getenv("CAMERA_ID", "5")
@@ -876,14 +915,16 @@ def main():
     check_interval = int(os.getenv("CHECK_INTERVAL", "10"))
     fragment_duration_ms = int(os.getenv("FRAGMENT_DURATION_MS", "10000"))
 
-    send_startup_message(telegram, camera_name, camera_id, tracker, check_interval)
+    send_startup_message(
+        telegram, camera_name, camera_id, manager, check_interval, fragment_duration_ms
+    )
 
     logger.info(f"👁️  Мониторинг камеры: {camera_name} (ID: {camera_id})")
     logger.info(f"📹 Режим: отправка фрагментами по {fragment_duration_ms/1000} секунд")
     logger.info(f"🔄 Интервал проверки: {check_interval} секунд")
 
     shutdown_requested = False
-    new_recordings_session = 0
+    new_fragments_session = 0
 
     def signal_handler(signum, frame):
         nonlocal shutdown_requested
@@ -899,40 +940,74 @@ def main():
         try:
             current_time = int(time.time())
 
-            # Получаем записи за последние 5 минут
+            # Получаем записи за последние 10 минут
             recordings = synology.get_recordings(
                 camera_id=camera_id,
-                limit=20,
-                from_time=current_time - 300,
+                limit=30,
+                from_time=current_time - 600,
                 to_time=current_time,
             )
 
             if recordings:
                 logger.debug(f"🔍 Найдено {len(recordings)} записей")
 
-                # Обрабатываем записи от старых к новым
+                # Обрабатываем все записи
                 for recording in recordings:
                     # Пропускаем завершённые записи
-                    if tracker.is_completed(recording.id):
+                    if manager.is_completed(recording.id):
                         continue
 
-                    # Обрабатываем запись фрагментами
-                    if process_recording_fragments(
+                    # Обрабатываем запись
+                    fragments_sent = process_recording(
                         synology,
                         telegram,
-                        tracker,
+                        manager,
                         recording,
                         camera_name,
                         fragment_duration_ms,
-                    ):
-                        new_recordings_session += 1
+                    )
+                    new_fragments_session += fragments_sent
+
+            # Также обрабатываем активные записи, которые могли не попасть в текущий список
+            active_recordings = manager.get_active_recordings()
+            for recording_id in active_recordings:
+                # Пытаемся получить актуальную информацию о записи
+                # Для этого ищем запись в новом списке
+                current_recording = None
+                for rec in recordings:
+                    if rec.id == recording_id:
+                        current_recording = rec
+                        break
+
+                if current_recording:
+                    # Обрабатываем с актуальными данными
+                    fragments_sent = process_recording(
+                        synology,
+                        telegram,
+                        manager,
+                        current_recording,
+                        camera_name,
+                        fragment_duration_ms,
+                    )
+                    new_fragments_session += fragments_sent
+                else:
+                    # Запись не найдена в текущем списке - возможно, она завершена
+                    progress = manager.get_progress(recording_id)
+                    if progress and time.time() - progress.last_checked_time > 60:
+                        # Не видели запись более 60 секунд - помечаем как завершённую
+                        logger.info(
+                            f"⏱️ Запись {recording_id} не найдена в текущем списке, помечаю как завершённую"
+                        )
+                        manager.mark_completed(recording_id)
 
             # Периодически очищаем старые записи
             if int(time.time()) % 300 == 0:  # Каждые 5 минут
-                tracker.cleanup_old_records()
+                manager.cleanup_old_records()
+                stats = manager.get_stats()
                 logger.info(
-                    f"📊 Статистика: {len(tracker.active_recordings)} активных записей, "
-                    f"{len(tracker.completed_recordings)} завершённых"
+                    f"📊 Статистика: {stats['active_recordings']} активных записей, "
+                    f"{stats['completed_recordings']} завершённых, "
+                    f"{stats['total_fragments_sent']} всего фрагментов"
                 )
 
             # Ждем следующей проверки
@@ -951,14 +1026,14 @@ def main():
 
     session_duration = time.time() - start_time
 
-    send_shutdown_message(telegram, tracker, new_recordings_session, session_duration)
+    send_shutdown_message(telegram, manager, new_fragments_session, session_duration)
 
     logger.info(
         f"👋 Завершение работы бота. Время работы: {session_duration:.1f} секунд"
     )
-    logger.info(f"📊 Итог сессии: обработано {new_recordings_session} новых фрагментов")
+    logger.info(f"📊 Итог сессии: отправлено {new_fragments_session} новых фрагментов")
 
-    tracker.save_state()
+    manager.save_state()
 
 
 if __name__ == "__main__":
