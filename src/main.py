@@ -159,7 +159,7 @@ class SynologyAPI:
         self.base_url = f"https://{self.syno_ip}:{self.syno_port}/webapi/entry.cgi"
 
         self.session = requests.Session()
-        self.session.verify = False  # Отключаем SSL проверку для диагностики
+        self.session.verify = True
         self.sid = None
         self.last_login = None
         self.cameras_cache: Dict[str, Dict] = {}
