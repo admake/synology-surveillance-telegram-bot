@@ -14,6 +14,15 @@ RUN python -m venv /opt/venv && \
 # Финальный образ
 FROM python:3.11-slim-bookworm
 
+# Устанавливаем системные зависимости
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    libxcb1 \
+    libxcb-shm0 \
+    libxcb-shape0 \
+    libxcb-xfixes0 && \
+    rm -rf /var/lib/apt/lists/*
+
 # Устанавливаем curl для healthcheck
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
