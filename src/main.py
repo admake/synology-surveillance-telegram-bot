@@ -436,6 +436,7 @@ class OptimizedSynologyAPI:
             logger.debug(
                 f"📥 Скачиваю фрагмент записи {recording_id}: "
                 f"смещение={offset_ms/1000:.1f}с"
+            )
             response = self.session.get(
                 self.base_url, params=params, stream=True, timeout=20
             )
