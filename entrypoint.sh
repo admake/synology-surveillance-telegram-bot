@@ -40,7 +40,7 @@ graceful_shutdown() {
 trap 'graceful_shutdown' TERM INT
 
 # Проверка обязательных переменных
-required_vars="SYNO_IP SYNO_PASS TG_TOKEN TG_CHAT_ID"
+required_vars="SYNO_IP SYNO_USER SYNO_PASS TG_TOKEN TG_CHAT_ID"
 missing_vars=""
 
 for var in $required_vars; do
