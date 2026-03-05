@@ -1,4 +1,5 @@
 requests==2.31.0
+PySocks==1.7.1
 tenacity==8.2.3  # Для retry логики
 python-json-logger==2.0.7
 python-dotenv==1.0.0

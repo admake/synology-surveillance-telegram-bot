@@ -46,6 +46,7 @@ class AppConfig:
     max_consecutive_fails: int = 3
     cleanup_max_age_hours: int = 24
     ssl_verify: bool = False
+    tg_proxy: Optional[str] = None
 
     @classmethod
     def from_env(cls) -> "AppConfig":
@@ -61,6 +62,7 @@ class AppConfig:
         c.state_file = os.getenv("STATE_FILE", c.state_file)
         c.camera_id = os.getenv("CAMERA_ID", c.camera_id)
         c.ssl_verify = os.getenv("SSL_VERIFY", "false").lower() in ("true", "1", "yes")
+        c.tg_proxy = os.getenv("TG_PROXY") or None
         return c
 
 
@@ -381,16 +383,20 @@ class SynologyAPI:
 class TelegramBot:
     MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
 
-    def __init__(self):
+    def __init__(self, proxy: Optional[str] = None):
         self.token = os.getenv("TG_TOKEN")
         self.chat_id = os.getenv("TG_CHAT_ID")
         self.base_url = f"https://api.telegram.org/bot{self.token}"
         self.bot_name: Optional[str] = None
+        self.session = requests.Session()
+        if proxy:
+            self.session.proxies = {"http": proxy, "https": proxy}
+            logger.info(f"Telegram: используется прокси {proxy}")
         self._check_connection()
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=5))
     def _check_connection(self) -> None:
-        response = requests.get(f"{self.base_url}/getMe", timeout=10)
+        response = self.session.get(f"{self.base_url}/getMe", timeout=10)
         response.raise_for_status()
         data = response.json()
         if data.get("ok"):
@@ -406,7 +412,7 @@ class TelegramBot:
     )
     def send_message(self, text: str) -> bool:
         try:
-            response = requests.post(
+            response = self.session.post(
                 f"{self.base_url}/sendMessage",
                 json={"chat_id": self.chat_id, "text": text, "parse_mode": "HTML"},
                 timeout=10,
@@ -427,7 +433,7 @@ class TelegramBot:
         logger.info(f"Отправляю видео в Telegram ({file_size / (1024*1024):.1f} МБ)")
         try:
             with open(video_path, "rb") as f:
-                response = requests.post(
+                response = self.session.post(
                     f"{self.base_url}/sendVideo",
                     files={"video": f},
                     data={
@@ -694,7 +700,7 @@ def main() -> None:
 
     config = AppConfig.from_env()
     synology = SynologyAPI(config)
-    telegram = TelegramBot()
+    telegram = TelegramBot(proxy=config.tg_proxy)
     state = StateManager(config)
 
     synology.get_cameras()

@@ -15,6 +15,7 @@ services:
       - CAMERA_ID=${CAMERA_ID:-1}
       - TG_TOKEN=${TG_TOKEN}
       - TG_CHAT_ID=${TG_CHAT_ID}
+      - TG_PROXY=${TG_PROXY:-}
       - CHECK_INTERVAL=${CHECK_INTERVAL:-30}
       - LOOKBACK_MINUTES=${LOOKBACK_MINUTES:-5}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
