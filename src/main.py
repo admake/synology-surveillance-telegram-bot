@@ -44,6 +44,7 @@ class AppConfig:
     camera_id: str = "1"
     lookback_minutes: int = 30
     max_consecutive_fails: int = 3
+    max_fragments_per_cycle: int = 20
     cleanup_max_age_hours: int = 24
     ssl_verify: bool = False
     tg_proxy: Optional[str] = None
@@ -59,6 +60,8 @@ class AppConfig:
             c.lookback_minutes = int(v)
         if v := os.getenv("MAX_CONSECUTIVE_FAILS"):
             c.max_consecutive_fails = int(v)
+        if v := os.getenv("MAX_FRAGMENTS_PER_CYCLE"):
+            c.max_fragments_per_cycle = int(v)
         c.state_file = os.getenv("STATE_FILE", c.state_file)
         c.camera_id = os.getenv("CAMERA_ID", c.camera_id)
         c.ssl_verify = os.getenv("SSL_VERIFY", "false").lower() in ("true", "1", "yes")
@@ -91,6 +94,7 @@ class FragmentProgress:
     known_duration_ms: int = 0       # latest known duration from API (grows for active recordings)
     at_end_since_duration_ms: int = 0  # duration value when we last reached the end (stability check)
     last_seen_time: float = 0
+    in_progress_offset_ms: int = -1  # set before send; on restart skip past if still set (crash guard)
 
 
 # ============================================================================
@@ -433,24 +437,33 @@ class TelegramBot:
 
         logger.info(f"Отправляю видео в Telegram ({file_size / (1024*1024):.1f} МБ)")
         try:
-            with open(video_path, "rb") as f:
-                response = self.session.post(
-                    f"{self.base_url}/sendVideo",
-                    files={"video": f},
-                    data={
-                        "chat_id": self.chat_id,
-                        "caption": caption,
-                        "supports_streaming": True,
-                        "parse_mode": "HTML",
-                    },
-                    timeout=120,
-                )
+            for attempt in range(2):  # one automatic retry on 429
+                with open(video_path, "rb") as f:
+                    response = self.session.post(
+                        f"{self.base_url}/sendVideo",
+                        files={"video": f},
+                        data={
+                            "chat_id": self.chat_id,
+                            "caption": caption,
+                            "supports_streaming": True,
+                            "parse_mode": "HTML",
+                        },
+                        timeout=120,
+                    )
 
-            if response.status_code == 200 and response.json().get("ok"):
-                logger.info("Видео успешно отправлено")
-                return True
+                if response.status_code == 200 and response.json().get("ok"):
+                    logger.info("Видео успешно отправлено")
+                    return True
 
-            logger.error(f"Telegram API ошибка: {response.status_code} — {response.text}")
+                if response.status_code == 429 and attempt == 0:
+                    retry_after = response.json().get("parameters", {}).get("retry_after", 30)
+                    logger.warning(f"Telegram rate limit: жду {retry_after}с перед повтором")
+                    time.sleep(retry_after)
+                    continue
+
+                logger.error(f"Telegram API ошибка: {response.status_code} — {response.text}")
+                return False
+
             return False
 
         except Exception as e:
@@ -480,7 +493,7 @@ class StateManager:
 
             self.completed_ids = set(state.get("completed_ids", []))
             for rec_id, d in state.get("progress", {}).items():
-                self.progress[rec_id] = FragmentProgress(
+                p = FragmentProgress(
                     recording_id=rec_id,
                     next_offset_ms=d.get("next_offset_ms", 0),
                     fragments_sent=d.get("fragments_sent", 0),
@@ -490,7 +503,19 @@ class StateManager:
                     known_duration_ms=d.get("known_duration_ms", 0),
                     at_end_since_duration_ms=d.get("at_end_since_duration_ms", 0),
                     last_seen_time=d.get("last_seen_time", 0),
+                    in_progress_offset_ms=d.get("in_progress_offset_ms", -1),
                 )
+                # Crash guard: if we died between pre-commit-save and mark_fragment_sent,
+                # advance past the in-progress fragment to avoid a duplicate send.
+                if p.in_progress_offset_ms > p.next_offset_ms:
+                    logger.warning(
+                        f"Запись {rec_id}: обнаружен незавершённый фрагмент "
+                        f"(in_progress={p.in_progress_offset_ms}ms > "
+                        f"next={p.next_offset_ms}ms) — пропускаю во избежание дубликата"
+                    )
+                    p.next_offset_ms = p.in_progress_offset_ms
+                    p.in_progress_offset_ms = -1
+                self.progress[rec_id] = p
             logger.info(f"Состояние загружено: {len(self.progress)} активных записей")
         except Exception as e:
             logger.warning(f"Не удалось загрузить состояние: {e}")
@@ -510,6 +535,7 @@ class StateManager:
                         "known_duration_ms": p.known_duration_ms,
                         "at_end_since_duration_ms": p.at_end_since_duration_ms,
                         "last_seen_time": p.last_seen_time,
+                        "in_progress_offset_ms": p.in_progress_offset_ms,
                     }
                     for rec_id, p in self.progress.items()
                 },
@@ -547,6 +573,7 @@ class StateManager:
             p.fragments_sent += 1
             p.last_attempt_time = time.time()
             p.consecutive_fails = 0
+            p.in_progress_offset_ms = -1  # clear pre-commit on successful send
         self.save()
 
     def mark_fragment_failed(self, recording_id: str) -> None:
@@ -554,6 +581,7 @@ class StateManager:
             p = self.progress[recording_id]
             p.last_attempt_time = time.time()
             p.consecutive_fails += 1
+            p.in_progress_offset_ms = -1  # known failure — clear pre-commit so next cycle retries
         self.save()
 
     def mark_completed(self, recording_id: str) -> None:
@@ -618,6 +646,7 @@ def process_recording(
     camera_name: str,
     fragment_duration_ms: int,
     max_consecutive_fails: int,
+    max_fragments_per_cycle: int = 20,
 ) -> int:
     """
     Downloads and sends all currently available fragments for a recording.
@@ -629,6 +658,7 @@ def process_recording(
       This prevents both premature completion and infinite loops.
     """
     sent = 0
+    fragments_this_cycle = 0
     progress = state.get_or_create_progress(recording)
 
     if progress.is_completed:
@@ -659,6 +689,13 @@ def process_recording(
     # 3. Inner loop: send all currently available fragments.
     # ------------------------------------------------------------------
     while not progress.is_completed:
+        if fragments_this_cycle >= max_fragments_per_cycle:
+            logger.debug(
+                f"Запись {recording.id}: лимит {max_fragments_per_cycle} фрагментов за цикл — "
+                f"продолжу в следующем цикле"
+            )
+            break
+
         # Reached the end of currently available data → mark for stability
         # check on the next cycle and stop for now.
         if progress.known_duration_ms > 0 and progress.next_offset_ms >= progress.known_duration_ms:
@@ -715,11 +752,16 @@ def process_recording(
                 actual_duration,
             )
 
+            # Pre-commit the next offset BEFORE sending so that if the process
+            # crashes mid-send we skip this fragment on restart (at-most-once).
+            next_offset = progress.next_offset_ms + int(actual_duration * 1000)
+            progress.in_progress_offset_ms = next_offset
+            state.save()
+
             if telegram.send_video(fragment_file, caption):
-                # Advance by actual duration so we don't skip data at the live edge.
-                next_offset = progress.next_offset_ms + int(actual_duration * 1000)
                 state.mark_fragment_sent(recording.id, next_offset)
                 sent += 1
+                fragments_this_cycle += 1
             else:
                 state.mark_fragment_failed(recording.id)
                 break
@@ -811,7 +853,8 @@ def main() -> None:
                     continue
                 fragments_this_session += process_recording(
                     synology, telegram, state, recording,
-                    camera_name, config.fragment_duration_ms, config.max_consecutive_fails,
+                    camera_name, config.fragment_duration_ms,
+                    config.max_consecutive_fails, config.max_fragments_per_cycle,
                 )
 
             # Mark recordings that have disappeared from the API window as completed
