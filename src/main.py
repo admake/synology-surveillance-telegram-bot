@@ -42,7 +42,7 @@ class AppConfig:
     fragment_duration_ms: int = 10000
     state_file: str = "/data/state.json"
     camera_id: str = "1"
-    lookback_minutes: int = 5
+    lookback_minutes: int = 30
     max_consecutive_fails: int = 3
     cleanup_max_age_hours: int = 24
     ssl_verify: bool = False
@@ -88,7 +88,8 @@ class FragmentProgress:
     last_attempt_time: float = 0
     consecutive_fails: int = 0
     is_completed: bool = False
-    total_duration_ms: int = 0  # populated from recording.duration
+    known_duration_ms: int = 0       # latest known duration from API (grows for active recordings)
+    at_end_since_duration_ms: int = 0  # duration value when we last reached the end (stability check)
     last_seen_time: float = 0
 
 
@@ -486,7 +487,8 @@ class StateManager:
                     last_attempt_time=d.get("last_attempt_time", 0),
                     consecutive_fails=d.get("consecutive_fails", 0),
                     is_completed=d.get("is_completed", False),
-                    total_duration_ms=d.get("total_duration_ms", 0),
+                    known_duration_ms=d.get("known_duration_ms", 0),
+                    at_end_since_duration_ms=d.get("at_end_since_duration_ms", 0),
                     last_seen_time=d.get("last_seen_time", 0),
                 )
             logger.info(f"Состояние загружено: {len(self.progress)} активных записей")
@@ -505,15 +507,18 @@ class StateManager:
                         "last_attempt_time": p.last_attempt_time,
                         "consecutive_fails": p.consecutive_fails,
                         "is_completed": p.is_completed,
-                        "total_duration_ms": p.total_duration_ms,
+                        "known_duration_ms": p.known_duration_ms,
+                        "at_end_since_duration_ms": p.at_end_since_duration_ms,
                         "last_seen_time": p.last_seen_time,
                     }
                     for rec_id, p in self.progress.items()
                 },
                 "updated_at": datetime.now().isoformat(),
             }
-            with open(self.state_file, "w") as f:
+            tmp = self.state_file.with_suffix(".tmp")
+            with open(tmp, "w") as f:
                 json.dump(state, f, indent=2, ensure_ascii=False)
+            tmp.replace(self.state_file)
         except Exception as e:
             logger.error(f"Ошибка сохранения состояния: {e}")
 
@@ -533,11 +538,6 @@ class StateManager:
 
         p = self.progress[rec_id]
         p.last_seen_time = time.time()
-
-        # Update total duration from API whenever it becomes available
-        if recording.duration > 0:
-            p.total_duration_ms = recording.duration * 1000
-
         return p
 
     def mark_fragment_sent(self, recording_id: str, next_offset_ms: int) -> None:
@@ -587,6 +587,10 @@ class StateManager:
 # Fragment processing
 # ============================================================================
 
+# Fragments shorter than this are considered "no data available yet" at the
+# edge of an active recording, not a real error.
+MIN_VALID_FRAGMENT_S = 0.5
+
 
 def _format_caption(
     recording: Recording,
@@ -617,44 +621,91 @@ def process_recording(
 ) -> int:
     """
     Downloads and sends all currently available fragments for a recording.
-    Returns the number of fragments successfully sent this call.
-    Stops when no more data is available (empty download) or an error occurs.
+    Returns the number of fragments successfully sent this cycle.
+
+    Completion logic (handles Synology's live-appending behaviour):
+      A recording is considered finished only when we have reached the end
+      AND the recording's duration has NOT grown since the previous cycle.
+      This prevents both premature completion and infinite loops.
     """
     sent = 0
     progress = state.get_or_create_progress(recording)
 
+    if progress.is_completed:
+        return 0
+
+    # ------------------------------------------------------------------
+    # 1. Refresh known duration from the current API response.
+    #    If the recording grew since last cycle, reset the stability marker.
+    # ------------------------------------------------------------------
+    current_duration_ms = recording.duration * 1000
+    if current_duration_ms > progress.known_duration_ms:
+        progress.known_duration_ms = current_duration_ms
+        progress.at_end_since_duration_ms = 0  # recording grew → re-open
+
+    # ------------------------------------------------------------------
+    # 2. Completion check: we were at the end last cycle with this exact
+    #    duration and it hasn't grown → recording is truly finished.
+    # ------------------------------------------------------------------
+    if (
+        progress.known_duration_ms > 0
+        and progress.next_offset_ms >= progress.known_duration_ms
+        and progress.at_end_since_duration_ms == progress.known_duration_ms
+    ):
+        state.mark_completed(recording.id)
+        return 0
+
+    # ------------------------------------------------------------------
+    # 3. Inner loop: send all currently available fragments.
+    # ------------------------------------------------------------------
     while not progress.is_completed:
-        # If we know the total duration, check if we're done
-        if progress.total_duration_ms > 0 and progress.next_offset_ms >= progress.total_duration_ms:
-            state.mark_completed(recording.id)
+        # Reached the end of currently available data → mark for stability
+        # check on the next cycle and stop for now.
+        if progress.known_duration_ms > 0 and progress.next_offset_ms >= progress.known_duration_ms:
+            if progress.at_end_since_duration_ms != progress.known_duration_ms:
+                progress.at_end_since_duration_ms = progress.known_duration_ms
+                state.save()
             break
 
-        # Trim last fragment to remaining duration if known
-        if progress.total_duration_ms > 0:
-            remaining_ms = progress.total_duration_ms - progress.next_offset_ms
-            request_duration_ms = min(fragment_duration_ms, remaining_ms)
+        # Clamp request to remaining known duration to avoid requesting past EOF.
+        if progress.known_duration_ms > 0:
+            remaining_ms = progress.known_duration_ms - progress.next_offset_ms
+            request_ms = min(fragment_duration_ms, remaining_ms)
         else:
-            request_duration_ms = fragment_duration_ms
+            request_ms = fragment_duration_ms
 
         fragment_file = synology.download_fragment(
-            recording.id, progress.next_offset_ms, request_duration_ms
+            recording.id, progress.next_offset_ms, request_ms
         )
 
         if not fragment_file:
-            state.mark_fragment_failed(recording.id)
+            # Network / auth error — count as failure, stop for this cycle.
+            progress.consecutive_fails += 1
+            state.save()
             if progress.consecutive_fails >= max_consecutive_fails:
-                logger.info(
-                    f"Запись {recording.id}: {max_consecutive_fails} неудачных попыток подряд, "
-                    f"помечаю как завершённую"
+                logger.warning(
+                    f"Запись {recording.id}: {progress.consecutive_fails} ошибок загрузки подряд, "
+                    f"пропускаю до следующего цикла"
                 )
-                state.mark_completed(recording.id)
-            # No more data available right now; stop trying this recording this cycle
             break
 
         try:
             actual_duration, ok = get_video_duration(fragment_file)
-            if not ok or actual_duration <= 0:
-                actual_duration = request_duration_ms / 1000
+
+            if not ok or actual_duration < MIN_VALID_FRAGMENT_S:
+                # Fragment is too short — we are at the live edge of an active
+                # recording.  This is NOT a download error; just wait.
+                logger.debug(
+                    f"Запись {recording.id}: фрагмент {actual_duration:.3f}с < "
+                    f"{MIN_VALID_FRAGMENT_S}с — данных ещё нет, жду следующего цикла"
+                )
+                if progress.at_end_since_duration_ms != progress.known_duration_ms:
+                    progress.at_end_since_duration_ms = progress.known_duration_ms
+                    state.save()
+                break
+
+            # Valid fragment — reset error counter.
+            progress.consecutive_fails = 0
 
             caption = _format_caption(
                 recording,
@@ -665,12 +716,10 @@ def process_recording(
             )
 
             if telegram.send_video(fragment_file, caption):
+                # Advance by actual duration so we don't skip data at the live edge.
                 next_offset = progress.next_offset_ms + int(actual_duration * 1000)
                 state.mark_fragment_sent(recording.id, next_offset)
                 sent += 1
-
-                if progress.total_duration_ms > 0 and progress.next_offset_ms >= progress.total_duration_ms:
-                    state.mark_completed(recording.id)
             else:
                 state.mark_fragment_failed(recording.id)
                 break
