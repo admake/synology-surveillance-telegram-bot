@@ -349,6 +349,109 @@ class TestAlreadyCompleted:
 
 
 # ---------------------------------------------------------------------------
+# process_recording: API loop detection (short recordings / oversized fragments)
+# ---------------------------------------------------------------------------
+
+class TestApiLoopDetection:
+    """
+    Synology returns the full recording regardless of offsetTimeMs when the
+    offset is past the recording length. The bot must detect this BEFORE
+    sending to avoid duplicate fragments.
+    """
+
+    @patch("os.remove")
+    def test_detects_loop_by_offset_past_video_length(self, mock_rm, tmp_path):
+        """
+        offset > actual_video_length AND actual > requested*1.05 → loop detected,
+        recording completed WITHOUT sending the duplicate.
+        """
+        config = _make_config(tmp_path, fragment_duration_ms=10000)
+        state = StateManager(config)
+        rec = _make_recording(rec_id="7", duration_s=0)  # API returns duration=0
+
+        # Bot is already at offset 50000ms but recording is only 11.856s
+        state.progress["7"] = RecordingProgress(
+            recording_id="7",
+            next_offset_ms=50000,
+            known_duration_ms=0,
+        )
+
+        video = _make_fake_video(tmp_path, "loop.mp4")
+        video_size = os.path.getsize(video)
+        synology = _mock_syno(video)
+        telegram = _mock_tg()
+
+        # Synology returns 11.856s even though we requested 10s (oversized, full recording)
+        with patch("main.get_video_duration", return_value=(11.856, True)):
+            sent = _proc(synology, telegram, state, rec, config)
+
+        assert sent == 0
+        assert telegram.send_video.call_count == 0, "must NOT send a duplicate"
+        assert state.is_completed("7"), "must mark completed"
+
+    @patch("os.remove")
+    def test_detects_loop_by_repeated_file_size(self, mock_rm, tmp_path):
+        """
+        When known_duration_ms is already set but Synology returns the same oversized
+        file for two consecutive offsets (actual recording is shorter than believed),
+        the second fragment triggers the repeated-size loop detection.
+
+        Scenario: bot believes recording is 50s, but actual recording is 11.856s.
+          - Fragment 1 at offset=0: oversized (11.856s > 10s), not past end (0 < 11856ms).
+            known_duration already set so no inference. Sent, offset advances to 11856ms.
+          - Fragment 2 at offset=11856ms: same file, same size, oversized.
+            repeated-size check fires → mark completed WITHOUT sending.
+        """
+        config = _make_config(tmp_path, fragment_duration_ms=10000, max_fragments_per_cycle=5)
+        state = StateManager(config)
+        rec = _make_recording(rec_id="8", duration_s=0)
+
+        # Bot believes recording is 50s, but Synology loops at 11.856s
+        state.progress["8"] = RecordingProgress(
+            recording_id="8",
+            next_offset_ms=0,
+            known_duration_ms=50000,
+        )
+
+        video = _make_fake_video(tmp_path, "loop2.mp4")
+        synology = _mock_syno(video)
+        telegram = _mock_tg()
+
+        with patch("main.get_video_duration", return_value=(11.856, True)):
+            sent = _proc(synology, telegram, state, rec, config)
+
+        assert sent == 1, "only first fragment should be sent"
+        assert telegram.send_video.call_count == 1
+        assert state.is_completed("8")
+
+    @patch("os.remove")
+    def test_normal_short_last_fragment_not_treated_as_loop(self, mock_rm, tmp_path):
+        """
+        A legitimately short last fragment (actual < requested) must NOT trigger loop detection.
+        """
+        config = _make_config(tmp_path, fragment_duration_ms=10000, end_stable_cycles=2)
+        state = StateManager(config)
+        rec = _make_recording(rec_id="9", duration_s=25)
+
+        # Recording is 25s, we're at offset 20s, last chunk is 5s (<10s requested)
+        state.progress["9"] = RecordingProgress(
+            recording_id="9",
+            next_offset_ms=20000,
+            known_duration_ms=25000,
+        )
+
+        video = _make_fake_video(tmp_path, "last_chunk.mp4")
+        synology = _mock_syno(video)
+        telegram = _mock_tg()
+
+        with patch("main.get_video_duration", return_value=(5.0, True)):
+            sent = _proc(synology, telegram, state, rec, config)
+
+        assert sent == 1, "last valid fragment must be sent"
+        assert not state.is_completed("9"), "must not be completed yet (needs stable cycles)"
+
+
+# ---------------------------------------------------------------------------
 # TelegramBot: 429 retry
 # ---------------------------------------------------------------------------
 

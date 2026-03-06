@@ -794,6 +794,45 @@ def process_recording(
             # Valid fragment — reset failure counter
             progress.consecutive_fails = 0
 
+            # API loop detection — BEFORE sending to avoid duplicate sends.
+            # When offset >= recording_length, Synology ignores offsetTimeMs and
+            # returns the full recording from the beginning. Detect via:
+            #   1) actual_duration > requested (>5% over): Synology gave us more than asked
+            #   2a) current offset already exceeds the returned video length → clearly looping
+            #   2b) same file size as previous fragment → same file returned at a different offset
+            actual_duration_ms = int(actual_duration * 1000)
+            oversized = actual_duration > (request_ms / 1000) * 1.05
+
+            if oversized and progress.next_offset_ms > actual_duration_ms:
+                logger.info(
+                    f"rec={recording.id}: offset {progress.next_offset_ms}ms > video length "
+                    f"{actual_duration_ms}ms — past end of recording (API loop), "
+                    f"marking completed without sending"
+                )
+                if progress.known_duration_ms == 0:
+                    progress.known_duration_ms = actual_duration_ms
+                state.mark_completed(recording.id, reason="offset past video length (API loop)")
+                break
+
+            if oversized and file_size == last_fragment_size and last_fragment_size > 0:
+                logger.info(
+                    f"rec={recording.id}: same file size {file_size/1024:.0f}KB at consecutive offsets "
+                    f"(actual={actual_duration:.2f}s > requested={request_ms/1000:.0f}s) — "
+                    f"API loop, marking completed without sending"
+                )
+                state.mark_completed(recording.id, reason="repeated oversized file (API loop)")
+                break
+
+            # If first oversized fragment and duration unknown → infer it.
+            # This allows the end-of-recording check at loop top to fire next iteration.
+            if oversized and progress.known_duration_ms == 0:
+                progress.known_duration_ms = actual_duration_ms
+                logger.info(
+                    f"rec={recording.id}: inferred duration={actual_duration_ms}ms "
+                    f"from oversized fragment (short recording)"
+                )
+                state.save()
+
             caption = _format_caption(
                 recording,
                 camera_name,
@@ -808,22 +847,6 @@ def process_recording(
                 state.mark_sent(recording.id, new_offset)
                 sent += 1
                 fragments_this_call += 1
-
-                # Detect end-of-recording API loop:
-                # When offset > actual recording length, Synology returns the same
-                # full-recording file regardless of offset. Two identical file sizes
-                # at different offsets indicate a loop — BUT only when the returned
-                # fragment is significantly longer than requested (i.e. the API gave
-                # us the whole recording instead of just the requested window).
-                oversized = actual_duration > (request_ms / 1000) * 1.5
-                if file_size == last_fragment_size and last_fragment_size > 0 and oversized:
-                    logger.info(
-                        f"rec={recording.id}: duplicate file size {file_size/1024:.0f} KB "
-                        f"(actual {actual_duration:.1f}s >> requested {request_ms/1000:.0f}s) "
-                        f"at offset {progress.next_offset_ms}ms — past end of recording, completing"
-                    )
-                    state.mark_completed(recording.id, reason="repeated oversized file (API loop detected)")
-                    break
                 last_fragment_size = file_size
             else:
                 state.mark_failed(recording.id)
