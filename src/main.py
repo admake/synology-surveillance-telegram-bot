@@ -150,7 +150,7 @@ def get_video_duration(file_path: str) -> Tuple[float, bool]:
 
 class SynologyAPI:
     # Tested recording API version
-    RECORDING_API_VERSION = "7"
+    RECORDING_API_VERSION = "6"
 
     def __init__(self, config: AppConfig):
         syno_ip = os.getenv("SYNO_IP")
@@ -272,17 +272,31 @@ class SynologyAPI:
             recordings = []
             for rec in data.get("data", {}).get("recordings", []):
                 try:
-                    start_time = rec.get("startTime", current_time - 60)
+                    # API v6 often omits startTime and duration.
+                    # Extract unix timestamp from filePath when available.
+                    # Format: .../camera-YYYYMMDD-HHMMSS-<unix_ms>-N.mp4
+                    start_time = rec.get("startTime") or 0
+                    if not start_time:
+                        fp = rec.get("filePath", "")
+                        for part in fp.replace(".mp4", "").split("-"):
+                            if len(part) == 13 and part.isdigit():
+                                start_time = int(part) // 1000  # ms -> s
+                                break
+                    if not start_time or start_time > current_time:
+                        start_time = current_time - 60
+
+                    duration = int(rec.get("duration") or 0)
+
                     recordings.append(Recording(
                         id=str(rec["id"]),
                         camera_id=str(rec.get("cameraId", "unknown")),
-                        start_time=max(1, min(start_time, current_time)),
-                        duration=int(rec.get("duration", 0)),
-                        size=int(rec.get("size", 0)),
+                        start_time=start_time,
+                        duration=duration,
+                        size=int(rec.get("sizeByte") or rec.get("size") or 0),
                     ))
                     logger.debug(
-                        f"  rec id={rec['id']} duration={rec.get('duration')}s "
-                        f"start={rec.get('startTime')}"
+                        f"  rec id={rec['id']} duration={duration}s "
+                        f"start={start_time} path={rec.get('filePath', '')}"
                     )
                 except Exception as e:
                     logger.warning(f"Recording parse error {rec.get('id')}: {e}")
@@ -348,12 +362,28 @@ class SynologyAPI:
                 os.remove(temp_path)
                 return None
 
-            bytes_written = 0
-            with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=32768):
-                    if chunk:
-                        f.write(chunk)
-                        bytes_written += len(chunk)
+            try:
+                with open(temp_path, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=32768):
+                        if chunk:
+                            f.write(chunk)
+            except RequestException as e:
+                # IncompleteRead / ChunkedEncodingError — partial download.
+                # If we got enough data (> 100 KB), the MP4 may still be valid.
+                file_size = os.path.getsize(temp_path) if os.path.exists(temp_path) else 0
+                if file_size > 102400:
+                    logger.warning(
+                        f"download_fragment: partial download {file_size/1024:.0f} KB "
+                        f"(IncompleteRead) for rec={recording_id} offset={offset_ms}ms "
+                        f"— trying to use partial file"
+                    )
+                    return temp_path
+                logger.error(
+                    f"download_fragment: IncompleteRead too small ({file_size} B) "
+                    f"rec={recording_id}: {e}"
+                )
+                self._cleanup_temp(temp_path)
+                return None
 
             file_size = os.path.getsize(temp_path)
             logger.debug(
@@ -690,6 +720,7 @@ def process_recording(
 
     sent = 0
     fragments_this_call = 0
+    last_fragment_size = -1  # used to detect end-of-recording API loop
 
     while not progress.is_completed:
         # Per-call fragment limit
@@ -777,6 +808,23 @@ def process_recording(
                 state.mark_sent(recording.id, new_offset)
                 sent += 1
                 fragments_this_call += 1
+
+                # Detect end-of-recording API loop:
+                # When offset > actual recording length, Synology returns the same
+                # full-recording file regardless of offset. Two identical file sizes
+                # at different offsets indicate a loop — BUT only when the returned
+                # fragment is significantly longer than requested (i.e. the API gave
+                # us the whole recording instead of just the requested window).
+                oversized = actual_duration > (request_ms / 1000) * 1.5
+                if file_size == last_fragment_size and last_fragment_size > 0 and oversized:
+                    logger.info(
+                        f"rec={recording.id}: duplicate file size {file_size/1024:.0f} KB "
+                        f"(actual {actual_duration:.1f}s >> requested {request_ms/1000:.0f}s) "
+                        f"at offset {progress.next_offset_ms}ms — past end of recording, completing"
+                    )
+                    state.mark_completed(recording.id, reason="repeated oversized file (API loop detected)")
+                    break
+                last_fragment_size = file_size
             else:
                 state.mark_failed(recording.id)
                 logger.warning(f"rec={recording.id}: send_video failed, stopping this cycle")
@@ -819,7 +867,10 @@ def main() -> None:
     telegram = TelegramBot(proxy=config.tg_proxy)
     state = StateManager(config)
 
-    synology.get_cameras()
+    try:
+        synology.get_cameras()
+    except Exception as e:
+        logger.warning(f"Could not fetch camera list (non-fatal): {e}")
     camera_name = synology.get_camera_name(config.camera_id)
 
     s = state.stats()
